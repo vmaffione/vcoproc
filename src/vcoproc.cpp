@@ -34,50 +34,51 @@ PrintVersionInfo()
 } // namespace
 
 class VCoproc {
-public:
-    static std::unique_ptr<VCoproc> CreateVCoproc(std::vector<std::string> input_dirs);
+    public:
+	static std::unique_ptr<VCoproc> CreateVCoproc(
+	    std::vector<std::string> input_dirs);
 
-    int Start();
+	int Start();
 };
 
 std::unique_ptr<VCoproc>
 VCoproc::CreateVCoproc(std::vector<std::string> input_dirs)
 {
-    return nullptr;
+	return nullptr;
 }
 
 int
 VCoproc::Start()
 {
-    return 0;
+	return 0;
 }
 
 int
 main(int argc, char **argv)
 {
-    std::vector<std::string> input_dirs;
-    int verbose = 0;
-    int opt;
+	std::vector<std::string> input_dirs;
+	int verbose = 0;
+	int opt;
 
-    auto vcoproc = VCoproc::CreateVCoproc(std::move(input_dirs));
+	auto vcoproc = VCoproc::CreateVCoproc(std::move(input_dirs));
 
-    while ((opt = getopt(argc, argv, "hVvi:o:")) != -1) {
-        switch (opt) {
-            case 'h':
-                Usage(argv[0]);
-                return 0;
-                break;
+	while ((opt = getopt(argc, argv, "hVvi:o:")) != -1) {
+		switch (opt) {
+		case 'h':
+			Usage(argv[0]);
+			return 0;
+			break;
 
-            case 'V':
-                PrintVersionInfo();
-                return 0;
-                break;
+		case 'V':
+			PrintVersionInfo();
+			return 0;
+			break;
 
-            case 'v':
-                verbose++;
-                break;
-        }
-    }
+		case 'v':
+			verbose++;
+			break;
+		}
+	}
 
-    return vcoproc->Start();
+	return vcoproc->Start();
 }
