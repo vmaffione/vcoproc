@@ -1,0 +1,150 @@
+#!/bin/bash
+
+
+printmsg() {
+    echo "$@" | tee -a config.log
+}
+
+no_cmake() {
+    printmsg "Cannot find CMake"
+    exit 255
+}
+
+
+usage() {
+    cat <<EOF
+configure options:
+
+    --help                      Show this help and exit
+    --prefix                    [/] Prefix path for installation of kernel and user components
+    --debug                     Compile in debug mode
+    --opt                       Compile with optimizations enabled (-O2)
+    --sanitize-includes         Use IWYU if available
+    --clang                     Use clang/clang++ compilers for the build
+EOF
+}
+
+
+# Default parameter values
+
+INSTALL_PREFIX="/"
+DEBUG="n"
+CLANG_PREFIX=""
+IWYU="n"
+USE_CLANG="n"
+OPTIMIZE="n"
+ARCH=`uname -m`
+
+# Option parsing
+while [[ $# > 0 ]]
+do
+    key="$1"
+    case $key in
+        "-h")
+            usage
+            exit 0
+        ;;
+
+        "--help")
+            usage
+            exit 0
+        ;;
+
+        "--prefix")
+        if [ -n "$2" ]; then
+            INSTALL_PREFIX=$2
+            shift
+        else
+            echo "--prefix requires a path argument"
+            exit 255
+        fi
+        ;;
+
+        "--debug")
+        DEBUG="y"
+        ;;
+
+        "--opt")
+        OPTIMIZE="y"
+        ;;
+
+        "--sanitize-includes")
+        IWYU="y"
+        ;;
+
+        "--clang")
+        USE_CLANG="y"
+        ;;
+
+        *)
+        echo "Unknown option '$key'"
+        echo "Try ./configure --help"
+        exit 255
+        ;;
+    esac
+    shift
+done
+
+# Make sure CMake is installed
+which cmake || no_cmake
+# Check if we have
+if [ $DEBUG == "y" ]; then
+	if [ $(which scan-build) ]; then
+	    CLANG_PREFIX="scan-build"
+	fi
+fi
+
+rm -f config.log
+
+if [[ -d .git ]]; then
+    REVISION=$(git rev-parse --verify HEAD)
+    if [ "$?" != "0" ]; then
+        REVISION="(unknown)"
+        REVISION_DATE="$REVISION"
+    else
+        REVISION_DATE=$(git show -s --format=%cd $REVISION)
+    fi
+else
+    REVISION="(unknown)"
+    REVISION_DATE="$(date)"
+fi
+
+cat >> config.log <<EOF
+##############################################################################
+# CONFIGURING VCOPROC FOR BUILD
+#     build date:    $(date)
+#     revision id:   $REVISION
+#     revision date: ${REVISION_DATE}
+##############################################################################
+EOF
+
+if [[ "$USE_CLANG" == "y" ]]; then
+    export CC=/usr/bin/clang
+    export CXX=/usr/bin/clang++
+fi
+
+# Configure CMake for out-of-tree build
+rm -rf build &> /dev/null
+mkdir build || exit 255
+
+if [ "$IWYU" == "y" ]; then
+    CMAKE_EXTRA+="-DCMAKE_CXX_INCLUDE_WHAT_YOU_USE=/usr/bin/iwyu;-Xiwyu;any;-Xiwyu;iwyu;-Xiwyu;args"
+        CMAKE_EXTRA+="-DCMAKE_C_INCLUDE_WHAT_YOU_USE=/usr/bin/iwyu;-Xiwyu;any;-Xiwyu;iwyu;-Xiwyu;args"
+fi
+
+(
+cd build
+${CLANG_PREFIX} cmake .. -DCMAKE_INSTALL_PREFIX=${INSTALL_PREFIX} -DCMAKE_BUILD_TYPE=Debug -DDEBUG=${DEBUG} -DARCH=${ARCH} -DOPTIMIZE=${OPTIMIZE} ${CMAKE_EXTRA}
+) | tee -a config.log
+
+# Generate the main Makefile
+cp Makefile.in Makefile
+sed -i "s|@ROOTDIR@|$PWD|g" Makefile
+sed -i "s|@CLANG_PREFIX@|${CLANG_PREFIX}|g" Makefile
+
+VERF=src/version.h
+echo "#ifndef __VCOPROC_VERSION_H__" > $VERF
+echo "#define __VCOPROC_VERSION_H__" >> $VERF
+echo "#define AD_REVISION_ID \"$REVISION\"" >> $VERF
+echo "#define AD_REVISION_DATE \"$REVISION_DATE\"" >> $VERF
+echo "#endif" >> $VERF
