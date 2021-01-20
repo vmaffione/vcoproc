@@ -145,6 +145,6 @@ sed -i "s|@CLANG_PREFIX@|${CLANG_PREFIX}|g" Makefile
 VERF=src/version.h
 echo "#ifndef __VCOPROC_VERSION_H__" > $VERF
 echo "#define __VCOPROC_VERSION_H__" >> $VERF
-echo "#define AD_REVISION_ID \"$REVISION\"" >> $VERF
-echo "#define AD_REVISION_DATE \"$REVISION_DATE\"" >> $VERF
+echo "#define VC_REVISION_ID \"$REVISION\"" >> $VERF
+echo "#define VC_REVISION_DATE \"$REVISION_DATE\"" >> $VERF
 echo "#endif" >> $VERF

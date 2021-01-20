@@ -29,7 +29,7 @@ set(INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src)
 message(STATUS "CMAKE_CURRENT_SOURCE_DIR: ${CMAKE_CURRENT_SOURCE_DIR}")
 message(STATUS "INCLUDE_DIR: ${INCLUDE_DIR}")
 
-add_definitions("-DAD_VERSION=${VCOPROC_VER_MAJ}.${VCOPROC_VER_MIN}")
+add_definitions("-DVC_VERSION=${VCOPROC_VER_MAJ}.${VCOPROC_VER_MIN}")
 add_definitions("-Wall -g -Werror")
 if(DEBUG STREQUAL "y")
     # Enable address sanitizer
