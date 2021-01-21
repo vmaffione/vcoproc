@@ -5,7 +5,10 @@
 #include <dirent.h>
 #include <iostream>
 #include <memory>
+#include <poll.h>
+#include <signal.h>
 #include <string>
+#include <sys/eventfd.h>
 #include <sys/types.h>
 #include <unistd.h>
 #include <vector>
@@ -40,9 +43,22 @@ PrintVersionInfo()
 		  << "    build date       : " << VC_REVISION_DATE << std::endl;
 }
 
+UniqueFd stopfd_global;
+
+void
+SigintHandler(int signum)
+{
+	int efd = stopfd_global;
+
+	if (efd >= 0) {
+		EventFdSignal(efd);
+	}
+}
+
 } // namespace
 
 class VCoproc {
+	int stopfd   = -1; /* owned by the caller, not by us */
 	bool verbose = false;
 	std::vector<std::string> input_dirs;
 	std::string output_dir;
@@ -52,9 +68,10 @@ class VCoproc {
 	struct InputFileInfo {
 		std::string filepath;
 		std::string filesubpath;
-		uint16_t channel;
+		unsigned int dir_idx;
 	};
 
+	int StoppableSleep(int milliseconds);
 	int NextInputFile(InputFileInfo &finfo);
 	int FirstInputFileFromDir(const std::string &dir,
 				  std::deque<std::string> &frontier,
@@ -62,25 +79,27 @@ class VCoproc {
 
     public:
 	static std::unique_ptr<VCoproc> CreateVCoproc(
-	    bool verbose, std::vector<std::string> input_dirs,
+	    int stopfd, bool verbose, std::vector<std::string> input_dirs,
 	    std::string output_dir);
 
-	VCoproc(bool verbose, std::vector<std::string> input_dirs,
+	VCoproc(int stopfd, bool verbose, std::vector<std::string> input_dirs,
 		std::string output_dir);
 	int Start();
 };
 
 std::unique_ptr<VCoproc>
-VCoproc::CreateVCoproc(bool verbose, std::vector<std::string> input_dirs,
+VCoproc::CreateVCoproc(int stopfd, bool verbose,
+		       std::vector<std::string> input_dirs,
 		       std::string output_dir)
 {
-	return std::make_unique<VCoproc>(verbose, std::move(input_dirs),
+	return std::make_unique<VCoproc>(stopfd, verbose, std::move(input_dirs),
 					 std::move(output_dir));
 }
 
-VCoproc::VCoproc(bool verbose, std::vector<std::string> input_dirs,
+VCoproc::VCoproc(int stopfd, bool verbose, std::vector<std::string> input_dirs,
 		 std::string output_dir)
-    : verbose(verbose),
+    : stopfd(stopfd),
+      verbose(verbose),
       input_dirs(std::move(input_dirs)),
       output_dir(std::move(output_dir))
 {
@@ -89,6 +108,78 @@ VCoproc::VCoproc(bool verbose, std::vector<std::string> input_dirs,
 int
 VCoproc::Start()
 {
+	int err = 0;
+
+	for (;;) {
+		InputFileInfo finfo;
+		int ret;
+
+		ret = NextInputFile(finfo);
+		if (ret < 0) {
+			err = ret;
+			break;
+		}
+
+		if (ret == 0) {
+			if (StoppableSleep(3000) > 0) {
+				std::cout << logb(LogInf)
+					  << "Stopping the sender loop"
+					  << std::endl
+					  << std::flush;
+				break;
+			}
+			continue;
+		}
+
+		// process
+		std::cout << "I should process " << finfo.filepath << std::endl;
+		break;
+	}
+
+	return err;
+}
+
+/*
+ * Sleep for a given number of milliseconds. On error, -1 is returned.
+ * If the loop was stopped during the sleep, it returns 1.
+ * If the sleep was not interrupted, it returns 0.
+ */
+int
+VCoproc::StoppableSleep(int milliseconds)
+{
+	struct pollfd pfd[1];
+
+	pfd[0].fd     = stopfd;
+	pfd[0].events = POLLIN;
+
+	for (;;) {
+		int ret = poll(pfd, 1, /*timeout_ms=*/milliseconds);
+
+		if (ret < 0) {
+			if (errno == EINTR) {
+				/*
+				 * This happens if a signal was caught
+				 * during poll. We just continue, so that
+				 * the signal handler can write to the
+				 * stopfd and poll() returns 1.
+				 */
+				continue;
+			}
+			std::cerr << logb(LogErr)
+				  << "poll() failed: " << strerror(errno)
+				  << std::endl;
+			return ret;
+		}
+
+		if (ret > 0) {
+			assert(pfd[0].revents & POLLIN);
+			EventFdDrain(stopfd);
+
+			return 1;
+		}
+		break;
+	}
+
 	return 0;
 }
 
@@ -138,14 +229,14 @@ VCoproc::NextInputFile(InputFileInfo &finfo)
 			    input_dirs[input_dir_idx].size());
 			finfo.filesubpath = finfo.filesubpath.substr(
 			    finfo.filesubpath.find_first_not_of('/'));
-			finfo.channel = input_dir_idx;
+			finfo.dir_idx = input_dir_idx;
 		}
 		if (++input_dir_idx >= input_dirs.size()) {
 			input_dir_idx = 0;
 		}
 	}
 
-	return 0;
+	return finfo.filepath.empty() ? 0 : 1;
 }
 
 int
@@ -250,8 +341,43 @@ main(int argc, char **argv)
 {
 	std::vector<std::string> input_dirs;
 	std::string output_dir;
+	struct sigaction sa;
 	int verbose = 0;
-	int opt;
+	int opt, ret;
+
+	/*
+	 * Open an eventfd to be used for synchronization with
+	 * the main loop.
+	 */
+	stopfd_global = UniqueFd(eventfd(0, 0));
+	if (stopfd_global < 0) {
+		std::cerr << logb(LogErr) << "Failed to open eventfd()"
+			  << std::endl;
+		return -1;
+	}
+
+	/*
+	 * Install a signal handler for SIGINT and SIGTERM to
+	 * tell the event loop to stop.
+	 */
+	sa.sa_handler = SigintHandler;
+	sigemptyset(&sa.sa_mask);
+	sa.sa_flags = SA_RESTART;
+	ret	    = sigaction(SIGINT, &sa, NULL);
+	if (ret) {
+		std::cerr << logb(LogErr)
+			  << "Failed to sigaction(SIGINT): " << strerror(errno)
+			  << std::endl;
+		return ret;
+	}
+
+	ret = sigaction(SIGTERM, &sa, NULL);
+	if (ret) {
+		std::cerr << logb(LogErr)
+			  << "Failed to sigaction(SIGTERM): " << strerror(errno)
+			  << std::endl;
+		return ret;
+	}
 
 	while ((opt = getopt(argc, argv, "hVvi:o:")) != -1) {
 		switch (opt) {
@@ -293,7 +419,8 @@ main(int argc, char **argv)
 		}
 	}
 
-	auto vcoproc = VCoproc::CreateVCoproc(verbose, std::move(input_dirs),
+	auto vcoproc = VCoproc::CreateVCoproc(stopfd_global, verbose,
+					      std::move(input_dirs),
 					      std::move(output_dir));
 	if (vcoproc == nullptr) {
 		return -1;
