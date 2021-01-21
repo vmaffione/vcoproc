@@ -268,15 +268,20 @@ class VCoproc {
 	std::string dbfile;
 	std::unique_ptr<SQLiteDbConn> dbconn;
 	size_t input_dir_idx = 0;
-	bool sorted	     = false;
 
 	enum class ProcStatus {
-		Invalid	   = 0,
+		None	   = 0,
 		New	   = 1,
 		InProgress = 2,
 		Completed  = 3,
 		Failed	   = 4,
 	};
+
+	/*
+	 * Max number of in progress entries that we allow in the
+	 * proc table at any time.
+	 */
+	static constexpr size_t MaxEntries = 5;
 
 	struct InputFileInfo {
 		std::string filepath;
@@ -285,11 +290,10 @@ class VCoproc {
 	};
 
 	int StoppableSleep(int milliseconds);
-	int NextInputFile(InputFileInfo &finfo);
-	int FirstInputFileFromDir(const std::string &dir,
-				  std::deque<std::string> &frontier,
-				  InputFileInfo &finfo);
-	unsigned int ProcStatusCount(ProcStatus status);
+	int FetchMoreFiles();
+	int FetchFilesFromDir(const std::string &dir,
+			      std::deque<std::string> &frontier, int &credits);
+	size_t ProcStatusCount(ProcStatus status = ProcStatus::None);
 
     public:
 	static std::unique_ptr<VCoproc> Create(
@@ -363,14 +367,16 @@ VCoproc::VCoproc(int stopfd, bool verbose, bool consume, bool monitor,
 {
 }
 
-unsigned int
+size_t
 VCoproc::ProcStatusCount(ProcStatus status)
 {
 	std::stringstream ss;
 	int ret, val;
 
-	ss << "SELECT count(*) FROM proc WHERE status = "
-	   << static_cast<int>(status);
+	ss << "SELECT count(*) FROM proc";
+	if (status != ProcStatus::None) {
+		ss << " WHERE status = " << static_cast<int>(status);
+	}
 
 	auto curs = dbconn->SelectStmt(ss, verbose);
 
@@ -382,8 +388,9 @@ VCoproc::ProcStatusCount(ProcStatus status)
 
 	ret = curs->RowColumn(0, val);
 	assert(ret);
+	assert(val >= 0);
 
-	return val;
+	return static_cast<size_t>(val);
 }
 
 int
@@ -393,16 +400,15 @@ VCoproc::MainLoop()
 
 	for (;;) {
 		/* Fetch the next file from one of the input directories. */
-		InputFileInfo finfo;
 		int ret;
 
-		ret = NextInputFile(finfo);
+		ret = FetchMoreFiles();
 		if (ret < 0) {
 			err = ret;
 			break;
 		}
 
-		if (ret == 0 || finfo.filepath.empty()) {
+		if (ProcStatusCount(ProcStatus::New) == 0) {
 			/*
 			 * No files to process. In monitor mode, sleep for
 			 * a little bit. Otherwise just stop.
@@ -421,15 +427,9 @@ VCoproc::MainLoop()
 			continue;
 		}
 
-		std::stringstream qss;
-		qss << "INSERT OR REPLACE INTO proc (src_path, status) VALUES "
-		       "(\""
-		    << finfo.filepath << "\","
-		    << static_cast<int>(ProcStatus::New) << ")";
-		if (dbconn->ModifyStmt(qss, verbose)) {
-			break;
-		}
-		std::cout << ProcStatusCount(ProcStatus::New) << std::endl;
+		std::cout << "I could process "
+			  << ProcStatusCount(ProcStatus::New) << " files"
+			  << std::endl;
 		break;
 	}
 
@@ -481,67 +481,53 @@ VCoproc::StoppableSleep(int milliseconds)
 }
 
 int
-VCoproc::NextInputFile(InputFileInfo &finfo)
+VCoproc::FetchMoreFiles()
 {
-	assert(input_dir_idx < input_dirs.size());
+	int credits = MaxEntries - ProcStatusCount();
 
-	finfo.filepath.clear();
-	finfo.filesubpath.clear();
+	if (credits <= 0) {
+		/* Nothing to do. */
+		return 0;
+	}
+
+	assert(input_dir_idx < input_dirs.size());
 
 	/*
 	 * Scan all the input directories, starting from the one that was
 	 * scanned less recently.
 	 */
-	for (size_t n = 0; n < input_dirs.size() && finfo.filepath.empty();
-	     n++) {
+	for (size_t n = 0; credits > 0 && n < input_dirs.size(); n++) {
 		/*
 		 * Visit this input directory and all of its input
-		 * subdirectories (recursively), stopping as soon as the
-		 * first file is found.
+		 * subdirectories (recursively).
 		 * The visit is implemented as a BFS (Breadth First Search).
 		 */
 		std::deque<std::string> frontier = {input_dirs[input_dir_idx]};
 
-		for (int c = 0;
-		     !frontier.empty() && finfo.filepath.empty() && c < 32;
+		for (int c = 0; !frontier.empty() && credits > 0 && c < 32;
 		     c++) {
 			std::string &dir = frontier.front();
 			int ret;
 
-			ret = FirstInputFileFromDir(dir, frontier, finfo);
+			ret = FetchFilesFromDir(dir, frontier, credits);
 			if (ret) {
 				return ret;
 			}
 
 			frontier.pop_front();
 		}
-		if (!finfo.filepath.empty()) {
-			/*
-			 * We found a file to transmit, and we need to compute
-			 * the subpath relative to the input directory (-i).
-			 */
-			assert(finfo.filepath.size() >
-			       input_dirs[input_dir_idx].size());
-			finfo.filesubpath = finfo.filepath.substr(
-			    input_dirs[input_dir_idx].size());
-			finfo.filesubpath = finfo.filesubpath.substr(
-			    finfo.filesubpath.find_first_not_of('/'));
-			finfo.dir_idx = input_dir_idx;
-		}
 		if (++input_dir_idx >= input_dirs.size()) {
 			input_dir_idx = 0;
 		}
 	}
 
-	return finfo.filepath.empty() ? 0 : 1;
+	return 0;
 }
 
 int
-VCoproc::FirstInputFileFromDir(const std::string &dirname,
-			       std::deque<std::string> &frontier,
-			       InputFileInfo &finfo)
+VCoproc::FetchFilesFromDir(const std::string &dirname,
+			   std::deque<std::string> &frontier, int &credits)
 {
-	std::vector<std::string> avail_files;
 	struct dirent *dent;
 	DIR *dir;
 
@@ -552,7 +538,7 @@ VCoproc::FirstInputFileFromDir(const std::string &dirname,
 		return -1;
 	}
 
-	while ((dent = readdir(dir)) != nullptr) {
+	while (credits > 0 && (dent = readdir(dir)) != nullptr) {
 		if (dent->d_name[0] == '.') {
 			/*
 			 * Ignore hidden files and directories,
@@ -611,24 +597,23 @@ VCoproc::FirstInputFileFromDir(const std::string &dirname,
 			continue;
 		}
 
-		if (sorted) {
-			avail_files.push_back(path);
-		} else {
-			/*
-			 * We finally got a file good for transfer. Fill in
-			 * the required information and return to the caller.
-			 */
-			finfo.filepath = std::move(path);
+		/*
+		 * We got a file good for processing. Insert it into the
+		 * database and decrease the credits.
+		 */
+		std::stringstream qss;
+
+		qss << "INSERT OR REPLACE INTO proc (src_path, status) VALUES "
+		       "(\""
+		    << path << "\"," << static_cast<int>(ProcStatus::New)
+		    << ")";
+		if (dbconn->ModifyStmt(qss, verbose)) {
 			break;
 		}
+		credits--;
 	}
 
 	closedir(dir);
-
-	if (sorted && !avail_files.empty()) {
-		std::sort(avail_files.begin(), avail_files.end());
-		finfo.filepath = std::move(avail_files.front());
-	}
 
 	return 0;
 }
