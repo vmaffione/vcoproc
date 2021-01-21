@@ -31,6 +31,10 @@ Usage(const char *progname)
 		  << std::endl
 		  << "    -o OUTPUT_DIR[,PAR1=VAL1,...] (directory to store "
 		     "incoming files)"
+		  << "    -c (consume input files)" << std::endl
+		  << "    -m (monitor input directories rather than stop when "
+		     "running out of files)"
+		  << std::endl
 		  << std::endl;
 }
 
@@ -60,6 +64,8 @@ SigintHandler(int signum)
 class VCoproc {
 	int stopfd   = -1; /* owned by the caller, not by us */
 	bool verbose = false;
+	bool consume = false;
+	bool monitor = false;
 	std::vector<std::string> input_dirs;
 	std::string output_dir;
 	size_t input_dir_idx = 0;
@@ -79,38 +85,54 @@ class VCoproc {
 
     public:
 	static std::unique_ptr<VCoproc> CreateVCoproc(
-	    int stopfd, bool verbose, std::vector<std::string> input_dirs,
-	    std::string output_dir);
+	    int stopfd, bool verbose, bool consume, bool monitor,
+	    std::vector<std::string> input_dirs, std::string output_dir);
 
-	VCoproc(int stopfd, bool verbose, std::vector<std::string> input_dirs,
-		std::string output_dir);
-	int Start();
+	VCoproc(int stopfd, bool verbose, bool consume, bool monitor,
+		std::vector<std::string> input_dirs, std::string output_dir);
+	int MainLoop();
 };
 
 std::unique_ptr<VCoproc>
-VCoproc::CreateVCoproc(int stopfd, bool verbose,
+VCoproc::CreateVCoproc(int stopfd, bool verbose, bool consume, bool monitor,
 		       std::vector<std::string> input_dirs,
 		       std::string output_dir)
 {
-	return std::make_unique<VCoproc>(stopfd, verbose, std::move(input_dirs),
+	if (input_dirs.empty()) {
+		std::cout << logb(LogErr) << "No input directories specified"
+			  << std::endl;
+		return nullptr;
+	}
+
+	if (output_dir.empty()) {
+		std::cout << logb(LogErr) << "No output directory specified"
+			  << std::endl;
+		return nullptr;
+	}
+
+	return std::make_unique<VCoproc>(stopfd, verbose, consume, monitor,
+					 std::move(input_dirs),
 					 std::move(output_dir));
 }
 
-VCoproc::VCoproc(int stopfd, bool verbose, std::vector<std::string> input_dirs,
-		 std::string output_dir)
+VCoproc::VCoproc(int stopfd, bool verbose, bool consume, bool monitor,
+		 std::vector<std::string> input_dirs, std::string output_dir)
     : stopfd(stopfd),
       verbose(verbose),
+      consume(consume),
+      monitor(monitor),
       input_dirs(std::move(input_dirs)),
       output_dir(std::move(output_dir))
 {
 }
 
 int
-VCoproc::Start()
+VCoproc::MainLoop()
 {
 	int err = 0;
 
 	for (;;) {
+		/* Fetch the next file from one of the input directories. */
 		InputFileInfo finfo;
 		int ret;
 
@@ -120,10 +142,18 @@ VCoproc::Start()
 			break;
 		}
 
-		if (ret == 0) {
+		if (ret == 0 || finfo.filepath.empty()) {
+			/*
+			 * No files to process. In monitor mode, sleep for
+			 * a little bit. Otherwise just stop.
+			 */
+			if (!monitor) {
+				break;
+			}
+
 			if (StoppableSleep(3000) > 0) {
 				std::cout << logb(LogInf)
-					  << "Stopping the sender loop"
+					  << "Stopping the main loop"
 					  << std::endl
 					  << std::flush;
 				break;
@@ -342,7 +372,9 @@ main(int argc, char **argv)
 	std::vector<std::string> input_dirs;
 	std::string output_dir;
 	struct sigaction sa;
-	int verbose = 0;
+	int verbose  = 0;
+	bool consume = false;
+	bool monitor = false;
 	int opt, ret;
 
 	/*
@@ -379,7 +411,7 @@ main(int argc, char **argv)
 		return ret;
 	}
 
-	while ((opt = getopt(argc, argv, "hVvi:o:")) != -1) {
+	while ((opt = getopt(argc, argv, "hVvi:o:cm")) != -1) {
 		switch (opt) {
 		case 'h':
 			Usage(argv[0]);
@@ -416,15 +448,23 @@ main(int argc, char **argv)
 			output_dir = std::string(optarg);
 			break;
 		}
+
+		case 'c':
+			consume = true;
+			break;
+
+		case 'm':
+			monitor = true;
+			break;
 		}
 	}
 
-	auto vcoproc = VCoproc::CreateVCoproc(stopfd_global, verbose,
-					      std::move(input_dirs),
+	auto vcoproc = VCoproc::CreateVCoproc(stopfd_global, verbose, consume,
+					      monitor, std::move(input_dirs),
 					      std::move(output_dir));
 	if (vcoproc == nullptr) {
 		return -1;
 	}
 
-	return vcoproc->Start();
+	return vcoproc->MainLoop();
 }

@@ -1,7 +1,10 @@
 find_package(Threads REQUIRED)
 find_package(CURL REQUIRED)
+find_package(SQLite3 REQUIRED)
 
 message(STATUS "CURL_LIBRARIES = ${CURL_LIBRARIES}")
+message(STATUS "SQLite3_LIBRARIES = ${SQLite3_LIBRARIES}")
+include_directories(${CURL_INCLUDE_DIRS} ${SQLite3_INCLUDE_DIRS})
 add_executable(vcoproc vcoproc.cpp utils.cpp)
-target_link_libraries(vcoproc ${CMAKE_THREAD_LIBS_INIT} m ${CURL_LIBRARIES})
+target_link_libraries(vcoproc ${CMAKE_THREAD_LIBS_INIT} m ${CURL_LIBRARIES} ${SQLite3_LIBRARIES})
 install(TARGETS vcoproc DESTINATION usr/bin)
