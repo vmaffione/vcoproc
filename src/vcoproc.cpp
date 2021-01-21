@@ -7,6 +7,8 @@
 #include <memory>
 #include <poll.h>
 #include <signal.h>
+#include <sqlite3.h>
+#include <sstream>
 #include <string>
 #include <sys/eventfd.h>
 #include <sys/types.h>
@@ -29,8 +31,11 @@ Usage(const char *progname)
 		  << "    -v (increase verbosity level)" << std::endl
 		  << "    -i INPUT_DIR (add directory to look for files)"
 		  << std::endl
-		  << "    -o OUTPUT_DIR[,PAR1=VAL1,...] (directory to store "
+		  << "    -o OUTPUT_DIR (directory to store "
 		     "incoming files)"
+		  << std::endl
+		  << "    -D DB_FILE (path to the sqlite3 database file)"
+		  << std::endl
 		  << "    -c (consume input files)" << std::endl
 		  << "    -m (monitor input directories rather than stop when "
 		     "running out of files)"
@@ -61,6 +66,198 @@ SigintHandler(int signum)
 
 } // namespace
 
+class SQLiteDbCursor {
+	sqlite3 *dbh	   = nullptr;
+	sqlite3_stmt *stmt = nullptr;
+	bool row_valid	   = false;
+
+    public:
+	SQLiteDbCursor(sqlite3 *dbh, sqlite3_stmt *stmt) : dbh(dbh), stmt(stmt)
+	{
+	}
+	~SQLiteDbCursor();
+	int NextRow();
+	bool RowColumnCheck(unsigned int idx);
+	bool RowColumn(unsigned int idx, int &val);
+	bool RowColumn(unsigned int idx, std::string &s);
+};
+
+SQLiteDbCursor::~SQLiteDbCursor()
+{
+	if (stmt != nullptr) {
+		int ret = sqlite3_finalize(stmt);
+
+		if (ret != SQLITE_OK) {
+			std::cerr << logb(LogErr)
+				  << "Failed to finalize cursor statement: "
+				  << sqlite3_errmsg(dbh) << std::endl;
+		}
+	}
+}
+
+int
+SQLiteDbCursor::NextRow()
+{
+	int ret = sqlite3_step(stmt);
+
+	row_valid = false; /* Reset the flag. */
+
+	switch (ret) {
+	case SQLITE_ROW:
+		/* A row is available. */
+		row_valid = true;
+		return 1;
+		break;
+
+	case SQLITE_DONE:
+		/* No more rows are available. */
+		return 0;
+		break;
+
+	default:
+		std::cerr << logb(LogErr)
+			  << "Failed to step statement: " << sqlite3_errmsg(dbh)
+			  << std::endl;
+		return -1;
+		break;
+	}
+
+	return -1; /* Not reachable. */
+}
+
+bool
+SQLiteDbCursor::RowColumnCheck(unsigned int idx)
+{
+	if (!row_valid) {
+		std::cerr << logb(LogErr) << "No row is available" << std::endl;
+		return false;
+	}
+
+	if (idx >= static_cast<unsigned int>(sqlite3_column_count(stmt))) {
+		std::cerr << logb(LogErr) << "Field index " << idx
+			  << " out of range" << std::endl;
+		return false;
+	}
+
+	return true;
+}
+
+bool
+SQLiteDbCursor::RowColumn(unsigned int idx, int &val)
+{
+	if (!RowColumnCheck(idx)) {
+		return false;
+	}
+
+	val = sqlite3_column_int(stmt, idx);
+
+	return true;
+}
+
+bool
+SQLiteDbCursor::RowColumn(unsigned int idx, std::string &s)
+{
+	if (!RowColumnCheck(idx)) {
+		return false;
+	}
+
+	std::stringstream ss;
+
+	ss << sqlite3_column_text(stmt, idx);
+	s = ss.str();
+
+	return true;
+}
+
+class SQLiteDbConn {
+	sqlite3 *dbh = nullptr;
+
+    public:
+	static std::unique_ptr<SQLiteDbConn> Create(const std::string &dbfile);
+	SQLiteDbConn(sqlite3 *dbh) : dbh(dbh) {}
+	~SQLiteDbConn();
+
+	int ModifyStmt(const std::stringstream &ss, bool verbose);
+	std::unique_ptr<SQLiteDbCursor> SelectStmt(const std::stringstream &ss,
+						   bool verbose);
+};
+
+std::unique_ptr<SQLiteDbConn>
+SQLiteDbConn::Create(const std::string &dbfile)
+{
+	sqlite3 *pdbh;
+	int ret;
+
+	ret = sqlite3_open_v2(dbfile.c_str(), &pdbh,
+			      SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+			      nullptr);
+	if (ret != SQLITE_OK) {
+		std::cerr << logb(LogErr) << "Failed to open " << dbfile << ": "
+			  << sqlite3_errmsg(pdbh) << std::endl;
+		return nullptr;
+	}
+
+	return std::make_unique<SQLiteDbConn>(pdbh);
+}
+
+SQLiteDbConn::~SQLiteDbConn()
+{
+	if (dbh != nullptr) {
+		sqlite3_close(dbh);
+	}
+}
+
+int
+SQLiteDbConn::ModifyStmt(const std::stringstream &ss, bool verbose)
+{
+	sqlite3_stmt *pstmt;
+	int ret = sqlite3_prepare_v2(dbh, ss.str().c_str(), /*nByte=*/-1,
+				     &pstmt, /*pzTail=*/nullptr);
+
+	if (ret != SQLITE_OK) {
+		std::cerr << logb(LogErr) << "Failed to prepare statement "
+			  << ss.str() << ": " << sqlite3_errmsg(dbh)
+			  << std::endl;
+		return -1;
+	}
+
+	ret = sqlite3_step(pstmt);
+	assert(ret != SQLITE_ROW); /* no results expected */
+
+	if (ret != SQLITE_DONE) {
+		std::cerr << logb(LogErr) << "Failed to evaluate statement "
+			  << ss.str() << ": " << sqlite3_errmsg(dbh)
+			  << std::endl;
+	}
+
+	int fret = sqlite3_finalize(pstmt);
+	if (ret == SQLITE_DONE && fret != SQLITE_OK) {
+		std::cerr << logb(LogErr) << "Failed to finalize statement "
+			  << ss.str() << ": " << sqlite3_errmsg(dbh)
+			  << std::endl;
+	}
+
+	return fret == SQLITE_OK ? 0 : -1;
+}
+
+std::unique_ptr<SQLiteDbCursor>
+SQLiteDbConn::SelectStmt(const std::stringstream &ss, bool verbose)
+{
+	sqlite3_stmt *pstmt;
+	int ret = sqlite3_prepare_v2(dbh, ss.str().c_str(), /*nByte=*/-1,
+				     &pstmt, /*pzTail=*/nullptr);
+
+	if (ret != SQLITE_OK) {
+		std::cerr << logb(LogErr) << "Failed to prepare statement "
+			  << ss.str() << ": " << sqlite3_errmsg(dbh)
+			  << std::endl;
+		return nullptr;
+	}
+
+	// TODO reference count the cursors ?
+	return std::make_unique<SQLiteDbCursor>(dbh, pstmt);
+}
+
 class VCoproc {
 	int stopfd   = -1; /* owned by the caller, not by us */
 	bool verbose = false;
@@ -68,8 +265,18 @@ class VCoproc {
 	bool monitor = false;
 	std::vector<std::string> input_dirs;
 	std::string output_dir;
+	std::string dbfile;
+	std::unique_ptr<SQLiteDbConn> dbconn;
 	size_t input_dir_idx = 0;
 	bool sorted	     = false;
+
+	enum class ProcStatus {
+		Invalid	   = 0,
+		New	   = 1,
+		InProgress = 2,
+		Completed  = 3,
+		Failed	   = 4,
+	};
 
 	struct InputFileInfo {
 		std::string filepath;
@@ -82,48 +289,101 @@ class VCoproc {
 	int FirstInputFileFromDir(const std::string &dir,
 				  std::deque<std::string> &frontier,
 				  InputFileInfo &finfo);
+	unsigned int ProcStatusCount(ProcStatus status);
 
     public:
-	static std::unique_ptr<VCoproc> CreateVCoproc(
+	static std::unique_ptr<VCoproc> Create(
 	    int stopfd, bool verbose, bool consume, bool monitor,
-	    std::vector<std::string> input_dirs, std::string output_dir);
+	    std::vector<std::string> input_dirs, std::string output_dir,
+	    std::string dbfile);
 
 	VCoproc(int stopfd, bool verbose, bool consume, bool monitor,
-		std::vector<std::string> input_dirs, std::string output_dir);
+		std::vector<std::string> input_dirs, std::string output_dir,
+		std::string dbfile, std::unique_ptr<SQLiteDbConn> dbconn);
 	int MainLoop();
 };
 
 std::unique_ptr<VCoproc>
-VCoproc::CreateVCoproc(int stopfd, bool verbose, bool consume, bool monitor,
-		       std::vector<std::string> input_dirs,
-		       std::string output_dir)
+VCoproc::Create(int stopfd, bool verbose, bool consume, bool monitor,
+		std::vector<std::string> input_dirs, std::string output_dir,
+		std::string dbfile)
 {
 	if (input_dirs.empty()) {
-		std::cout << logb(LogErr) << "No input directories specified"
+		std::cerr << logb(LogErr) << "No input directories specified"
 			  << std::endl;
 		return nullptr;
 	}
 
 	if (output_dir.empty()) {
-		std::cout << logb(LogErr) << "No output directory specified"
+		std::cerr << logb(LogErr) << "No output directory specified"
 			  << std::endl;
 		return nullptr;
 	}
 
-	return std::make_unique<VCoproc>(stopfd, verbose, consume, monitor,
-					 std::move(input_dirs),
-					 std::move(output_dir));
+	if (dbfile.empty()) {
+		std::cerr << logb(LogErr) << "No database file specified"
+			  << std::endl;
+		return nullptr;
+	}
+
+	/* Open a (long-lived) database connection. */
+	auto dbconn = SQLiteDbConn::Create(dbfile);
+	if (dbconn == nullptr) {
+		std::cerr << logb(LogErr) << "Failed to connect to database "
+			  << dbfile << std::endl;
+		return nullptr;
+	}
+
+	/* Create the proc table if it does not exist already. */
+	std::stringstream qss;
+	qss << "CREATE TABLE IF NOT EXISTS proc ("
+	    << "src_path VARCHAR(255) PRIMARY KEY NOT NULL, "
+	    << "status TINYINT NOT NULL, "
+	    << "mjson TEXT)";
+	if (dbconn->ModifyStmt(qss, verbose)) {
+		return nullptr;
+	}
+
+	return std::make_unique<VCoproc>(
+	    stopfd, verbose, consume, monitor, std::move(input_dirs),
+	    std::move(output_dir), std::move(dbfile), std::move(dbconn));
 }
 
 VCoproc::VCoproc(int stopfd, bool verbose, bool consume, bool monitor,
-		 std::vector<std::string> input_dirs, std::string output_dir)
+		 std::vector<std::string> input_dirs, std::string output_dir,
+		 std::string dbfile, std::unique_ptr<SQLiteDbConn> dbconn)
     : stopfd(stopfd),
       verbose(verbose),
       consume(consume),
       monitor(monitor),
       input_dirs(std::move(input_dirs)),
-      output_dir(std::move(output_dir))
+      output_dir(std::move(output_dir)),
+      dbfile(std::move(dbfile)),
+      dbconn(std::move(dbconn))
 {
+}
+
+unsigned int
+VCoproc::ProcStatusCount(ProcStatus status)
+{
+	std::stringstream ss;
+	int ret, val;
+
+	ss << "SELECT count(*) FROM proc WHERE status = "
+	   << static_cast<int>(status);
+
+	auto curs = dbconn->SelectStmt(ss, verbose);
+
+	ret = curs->NextRow();
+	if (ret < 0) {
+		return ret;
+	}
+	assert(ret > 0);
+
+	ret = curs->RowColumn(0, val);
+	assert(ret);
+
+	return val;
 }
 
 int
@@ -161,8 +421,15 @@ VCoproc::MainLoop()
 			continue;
 		}
 
-		// process
-		std::cout << "I should process " << finfo.filepath << std::endl;
+		std::stringstream qss;
+		qss << "INSERT OR REPLACE INTO proc (src_path, status) VALUES "
+		       "(\""
+		    << finfo.filepath << "\","
+		    << static_cast<int>(ProcStatus::New) << ")";
+		if (dbconn->ModifyStmt(qss, verbose)) {
+			break;
+		}
+		std::cout << ProcStatusCount(ProcStatus::New) << std::endl;
 		break;
 	}
 
@@ -371,6 +638,7 @@ main(int argc, char **argv)
 {
 	std::vector<std::string> input_dirs;
 	std::string output_dir;
+	std::string dbfile;
 	struct sigaction sa;
 	int verbose  = 0;
 	bool consume = false;
@@ -411,7 +679,7 @@ main(int argc, char **argv)
 		return ret;
 	}
 
-	while ((opt = getopt(argc, argv, "hVvi:o:cm")) != -1) {
+	while ((opt = getopt(argc, argv, "hVvi:o:cmD:")) != -1) {
 		switch (opt) {
 		case 'h':
 			Usage(argv[0]);
@@ -456,12 +724,17 @@ main(int argc, char **argv)
 		case 'm':
 			monitor = true;
 			break;
+
+		case 'D': {
+			dbfile = std::string(optarg);
+			break;
+		}
 		}
 	}
 
-	auto vcoproc = VCoproc::CreateVCoproc(stopfd_global, verbose, consume,
-					      monitor, std::move(input_dirs),
-					      std::move(output_dir));
+	auto vcoproc = VCoproc::Create(stopfd_global, verbose, consume, monitor,
+				       std::move(input_dirs),
+				       std::move(output_dir), dbfile);
 	if (vcoproc == nullptr) {
 		return -1;
 	}
