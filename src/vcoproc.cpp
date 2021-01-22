@@ -17,7 +17,8 @@
 #include <unordered_map>
 #include <vector>
 
-#include <utils.hpp>
+#include "utils.hpp"
+#include "json11.hpp"
 #include "version.h"
 
 using namespace utils;
@@ -277,43 +278,85 @@ SQLiteDbConn::SelectStmt(const std::stringstream &ss, bool verbose)
  * A class representing a pending entry in the proc table.
  */
 class PendingProc {
-	bool curl_pending = false;
+	CURLM *curlm = nullptr;
+	CURL *curl   = nullptr;
 	std::string src_path;
-	CURL *curl;
 
     public:
-	PendingProc(const std::string &src_path, CURL *curl)
-	    : src_path(src_path), curl(curl)
+	PendingProc(CURLM *curlm, CURL *curl, const std::string &src_path)
+	    : curlm(curlm), curl(curl), src_path(src_path)
 	{
 	}
-	~PendingProc()
-	{
-		if (curl != nullptr) {
-			curl_easy_cleanup(curl);
-		}
-	}
-	static std::unique_ptr<PendingProc> Create(const std::string &src_path);
-	int PreparePost(const std::string &url, const std::string &data);
+
+	~PendingProc();
+
+	enum class CurlStatus {
+		Idle	 = 0,
+		Prepared = 1,
+		Waiting	 = 2,
+	} curl_status = CurlStatus::Idle;
+
+	CurlStatus Status() const { return curl_status; }
+
+	static std::unique_ptr<PendingProc> Create(CURLM *curlm,
+						   const std::string &src_path);
+	int PreparePost(const std::string &url, const json11::Json &jsreq);
 };
 
 std::unique_ptr<PendingProc>
-PendingProc::Create(const std::string &src_path)
+PendingProc::Create(CURLM *curlm, const std::string &src_path)
 {
 	CURL *curl;
 
-	curl = curl_easy_init();
-	if (curl == nullptr) {
+	if (curlm == nullptr) {
 		return nullptr;
 	}
 
-	return std::make_unique<PendingProc>(src_path, curl);
+	curl = curl_easy_init();
+	if (curl == nullptr) {
+		std::cerr << logb(LogErr) << "Failed to create CURL easy handle"
+			  << std::endl;
+		return nullptr;
+	}
+
+	CURLMcode cm = curl_multi_add_handle(curlm, curl);
+	if (cm != CURLM_OK) {
+		std::cerr << "Failed to add handle to multi stack: "
+			  << curl_multi_strerror(cm) << std::endl;
+		return nullptr;
+	}
+
+	return std::make_unique<PendingProc>(curlm, curl, src_path);
+}
+
+PendingProc::~PendingProc()
+{
+	if (curl != nullptr) {
+		CURLMcode cm;
+
+		assert(curlm != nullptr);
+		cm = curl_multi_remove_handle(curlm, curl);
+		if (cm != CURLM_OK) {
+			std::cerr
+			    << "Failed to remove handle from multi stack: "
+			    << curl_multi_strerror(cm) << std::endl;
+		}
+		curl_easy_cleanup(curl);
+	}
 }
 
 /* Prepare a post request without performing it. */
 int
-PendingProc::PreparePost(const std::string &url, const std::string &data)
+PendingProc::PreparePost(const std::string &url, const json11::Json &jsreq)
 {
+	std::string data = jsreq.dump();
 	CURLcode cc;
+
+	if (curl_status != CurlStatus::Idle) {
+		std::cerr << "CURL status (" << static_cast<int>(curl_status)
+			  << ") is not idle" << std::endl;
+		return -1;
+	}
 
 	cc = curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
 	if (cc != CURLE_OK) {
@@ -340,6 +383,7 @@ PendingProc::PreparePost(const std::string &url, const std::string &data)
 		return -1;
 	}
 
+	curl_status = CurlStatus::Prepared;
 #if 0
 	cc = curl_easy_perform(curl);
 	if (cc != CURLE_OK) {
@@ -364,6 +408,7 @@ PendingProc::PreparePost(const std::string &url, const std::string &data)
 /* Main class. */
 class VCoproc {
 	int stopfd   = -1; /* owned by the caller, not by us */
+	CURLM *curlm = nullptr;
 	bool verbose = false;
 	bool consume = false;
 	bool monitor = false;
@@ -405,10 +450,12 @@ class VCoproc {
 	    std::vector<std::string> input_dirs, std::string output_dir,
 	    std::string dbfile, std::string host, unsigned short port);
 
-	VCoproc(int stopfd, bool verbose, bool consume, bool monitor,
-		std::vector<std::string> input_dirs, std::string output_dir,
-		std::string dbfile, std::unique_ptr<SQLiteDbConn> dbconn,
-		std::string host, unsigned short port);
+	VCoproc(int stopfd, CURLM *curlm, bool verbose, bool consume,
+		bool monitor, std::vector<std::string> input_dirs,
+		std::string output_dir, std::string dbfile,
+		std::unique_ptr<SQLiteDbConn> dbconn, std::string host,
+		unsigned short port);
+	~VCoproc();
 	int MainLoop();
 };
 
@@ -446,6 +493,13 @@ VCoproc::Create(int stopfd, bool verbose, bool consume, bool monitor,
 		return nullptr;
 	}
 
+	CURLM *curlm = curl_multi_init();
+	if (curlm == nullptr) {
+		std::cerr << logb(LogErr)
+			  << "Failed to create CURL multi handle" << std::endl;
+		return nullptr;
+	}
+
 	/* Open a (long-lived) database connection. */
 	auto dbconn = SQLiteDbConn::Create(dbfile);
 	if (dbconn == nullptr) {
@@ -465,16 +519,18 @@ VCoproc::Create(int stopfd, bool verbose, bool consume, bool monitor,
 	}
 
 	return std::make_unique<VCoproc>(
-	    stopfd, verbose, consume, monitor, std::move(input_dirs),
+	    stopfd, curlm, verbose, consume, monitor, std::move(input_dirs),
 	    std::move(output_dir), std::move(dbfile), std::move(dbconn),
 	    std::move(host), port);
 }
 
-VCoproc::VCoproc(int stopfd, bool verbose, bool consume, bool monitor,
-		 std::vector<std::string> input_dirs, std::string output_dir,
-		 std::string dbfile, std::unique_ptr<SQLiteDbConn> dbconn,
-		 std::string host, unsigned short port)
+VCoproc::VCoproc(int stopfd, CURLM *curlm, bool verbose, bool consume,
+		 bool monitor, std::vector<std::string> input_dirs,
+		 std::string output_dir, std::string dbfile,
+		 std::unique_ptr<SQLiteDbConn> dbconn, std::string host,
+		 unsigned short port)
     : stopfd(stopfd),
+      curlm(curlm),
       verbose(verbose),
       consume(consume),
       monitor(monitor),
@@ -485,6 +541,19 @@ VCoproc::VCoproc(int stopfd, bool verbose, bool consume, bool monitor,
       host(std::move(host)),
       port(port)
 {
+}
+
+VCoproc::~VCoproc()
+{
+	/*
+	 * PendingProc objects must be destroyed before calling
+	 * curl_multi_cleanup(). Force destruction with clear().
+	 */
+	pending.clear();
+
+	if (curlm != nullptr) {
+		curl_multi_cleanup(curlm);
+	}
 }
 
 size_t
@@ -752,8 +821,8 @@ VCoproc::MainLoop()
 		}
 
 		/*
-		 * Fetch any new entries and submit a POST request to
-		 * the backend engine.
+		 * Fetch any new entries and prepare a POST request to
+		 * submit to the backend engine.
 		 */
 		{
 			std::stringstream qss;
@@ -771,20 +840,27 @@ VCoproc::MainLoop()
 				std::string src_path;
 
 				curs_new->RowColumn(0, src_path);
-				pending[src_path] =
-				    std::move(PendingProc::Create(src_path));
+				pending[src_path] = std::move(
+				    PendingProc::Create(curlm, src_path));
 				auto &pproc = pending[src_path];
 				if (pproc == nullptr) {
 					continue; /* skip it for now */
 				}
 
-				std::stringstream data;
-				data << "{\"src_path\": \"" << src_path
-				     << "\"}";
+				json11::Json jsreq = json11::Json::object{
+				    {"file_name", src_path},
+				};
 				if (pproc->PreparePost(base_url + "/process",
-					data.str())) {
+						       jsreq)) {
 					continue;
 				}
+			}
+		}
+
+		for (auto &kv : pending) {
+			if (kv.second->Status() ==
+			    PendingProc::CurlStatus::Prepared) {
+				std::cout << "Sholud submit " << std::endl;
 			}
 		}
 
