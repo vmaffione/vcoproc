@@ -172,6 +172,16 @@ class Json final {
 	// otherwise.
 	const Json &operator[](const std::string &key) const;
 
+	bool has_key(const std::string &key) const
+	{
+		if (!is_object()) {
+			return false;
+		}
+
+		const auto &obj_items = object_items();
+		return obj_items.count(key);
+	}
+
 	// Serialize.
 	void dump(std::string &out) const;
 	std::string dump() const

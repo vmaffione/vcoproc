@@ -530,7 +530,7 @@ class VCoproc {
 	int FetchMoreFiles();
 	int FetchFilesFromDir(const std::string &dir,
 			      std::deque<std::string> &frontier, int &credits);
-	int CleanupComplete();
+	int CleanupCompleted();
 
     public:
 	static std::unique_ptr<VCoproc> Create(
@@ -824,7 +824,7 @@ VCoproc::FetchFilesFromDir(const std::string &dirname,
 }
 
 int
-VCoproc::CleanupComplete()
+VCoproc::CleanupCompleted()
 {
 	std::stringstream qss;
 
@@ -860,11 +860,11 @@ VCoproc::MainLoop()
 	int num_running_curls = 0, numfds = 0;
 	for (;;) {
 		/*
-		 * First, remove any completed or failed entries
-		 * from the pending, to make space for new
+		 * First, remove any completed entries from the
+		 * pending table, to make space for new input
 		 * files.
 		 */
-		err = CleanupComplete();
+		err = CleanupCompleted();
 		if (err) {
 			break;
 		}
@@ -906,7 +906,8 @@ VCoproc::MainLoop()
 			break;
 		}
 
-		/* Wait for any activity on a POST transfer. */
+		/* Wait for any activity on POST transfers. */
+		// TODO add the stop file descriptor
 		cm = curl_multi_wait(curlm, NULL, 0, 1000, &numfds);
 		if (cm != CURLM_OK) {
 			std::cerr << "Failed to wait multi handle: "
@@ -914,7 +915,7 @@ VCoproc::MainLoop()
 			break;
 		}
 
-		/* Process any completed transfers. */
+		/* Process any completed POST transfers. */
 		int msgs_left = -1;
 		CURLMsg *msg;
 		while ((msg = curl_multi_info_read(curlm, &msgs_left)) !=
@@ -947,14 +948,26 @@ VCoproc::MainLoop()
 				http_code = 400;
 			}
 
+			bool success = (http_code == 200);
 			json11::Json jsresp;
-			int ret = p->CompletePost(jsresp);
+
+			if (p->CompletePost(jsresp)) {
+				success = false;
+			}
 
 			std::cout << logb(LogDbg) << "Completed "
 				  << p->FilePath() << " --> " << http_code
 				  << " " << jsresp.dump() << std::endl;
 
-			if (ret || http_code != 200) {
+			if (!jsresp.has_key("status")) {
+				std::cerr << logb(LogErr)
+					  << "Missing status key" << std::endl;
+				success = false;
+			} else {
+				success = jsresp["status"] == "COMPLETE";
+			}
+
+			if (!success) {
 				p->SetStatus(ProcStatus::Failure);
 			} else {
 				p->SetStatus(ProcStatus::Success);
