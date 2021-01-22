@@ -274,13 +274,33 @@ SQLiteDbConn::SelectStmt(const std::stringstream &ss, bool verbose)
 	return std::make_unique<SQLiteDbCursor>(dbh, pstmt);
 }
 
+enum class ProcStatus {
+	None	   = 0,
+	New	   = 1,
+	InProgress = 2,
+	Completed  = 3,
+	Failed	   = 4,
+};
+
 /*
- * A class representing a pending entry in the proc table.
+ * A class representing an entry in the pending table.
  */
 class PendingProc {
+public:
+	enum class CurlStatus {
+		Idle	 = 0,
+		Prepared = 1,
+		Waiting	 = 2,
+	};
+
+private:
 	CURLM *curlm = nullptr;
 	CURL *curl   = nullptr;
 	std::string src_path;
+	std::string postdata;
+
+	CurlStatus curl_status = CurlStatus::Idle;
+	ProcStatus proc_status = ProcStatus::New;
 
     public:
 	PendingProc(CURLM *curlm, CURL *curl, const std::string &src_path)
@@ -290,14 +310,9 @@ class PendingProc {
 
 	~PendingProc();
 
-	enum class CurlStatus {
-		Idle	 = 0,
-		Prepared = 1,
-		Waiting	 = 2,
-	} curl_status = CurlStatus::Idle;
-
-	CurlStatus Status() const { return curl_status; }
-
+	ProcStatus Status() const { return proc_status; }
+	void SetStatus(ProcStatus status) { proc_status = status; }
+	std::string FilePath() const { return src_path; }
 	static std::unique_ptr<PendingProc> Create(CURLM *curlm,
 						   const std::string &src_path);
 	int PreparePost(const std::string &url, const json11::Json &jsreq);
@@ -326,7 +341,17 @@ PendingProc::Create(CURLM *curlm, const std::string &src_path)
 		return nullptr;
 	}
 
-	return std::make_unique<PendingProc>(curlm, curl, src_path);
+	auto proc = std::make_unique<PendingProc>(curlm, curl, src_path);
+
+	CURLcode cc = curl_easy_setopt(curl, CURLOPT_PRIVATE, (void *)proc.get());
+	if (cc != CURLE_OK) {
+		std::cerr << "Failed to set CURLOPT_PRIVATE: "
+			  << curl_easy_strerror(cc) << std::endl;
+		return nullptr;
+	}
+
+	return proc;
+
 }
 
 PendingProc::~PendingProc()
@@ -349,7 +374,6 @@ PendingProc::~PendingProc()
 int
 PendingProc::PreparePost(const std::string &url, const json11::Json &jsreq)
 {
-	std::string data = jsreq.dump();
 	CURLcode cc;
 
 	if (curl_status != CurlStatus::Idle) {
@@ -365,7 +389,13 @@ PendingProc::PreparePost(const std::string &url, const json11::Json &jsreq)
 		return -1;
 	}
 
-	cc = curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data.c_str());
+	/*
+	 * The data passed to CURLOPT_POSTFIELDS is not copied by libcurl
+	 * (by default), and therefore we must preserve it until the
+	 * end of the POST transfer.
+	 */
+	postdata = jsreq.dump();
+	cc = curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postdata.c_str());
 	if (cc != CURLE_OK) {
 		std::cerr << "Failed to set CURLOPT_POSTFIELDS: "
 			  << curl_easy_strerror(cc) << std::endl;
@@ -376,7 +406,7 @@ PendingProc::PreparePost(const std::string &url, const json11::Json &jsreq)
 	 * If we don't provide POSTFIELDSIZE, libcurl will strlen() by
 	 * itself.
 	 */
-	cc = curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, data.size());
+	cc = curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, postdata.size());
 	if (cc != CURLE_OK) {
 		std::cerr << "Failed to set CURLOPT_POSTFIELDSIZE: "
 			  << curl_easy_strerror(cc) << std::endl;
@@ -420,17 +450,9 @@ class VCoproc {
 	unsigned short port  = 0;
 	size_t input_dir_idx = 0;
 
-	enum class ProcStatus {
-		None	   = 0,
-		New	   = 1,
-		InProgress = 2,
-		Completed  = 3,
-		Failed	   = 4,
-	};
-
 	/*
 	 * Max number of in progress entries that we allow in the
-	 * proc table at any time.
+	 * pending table at any time.
 	 */
 	static constexpr size_t MaxEntries = 5;
 
@@ -442,7 +464,6 @@ class VCoproc {
 	int FetchFilesFromDir(const std::string &dir,
 			      std::deque<std::string> &frontier, int &credits);
 	int CleanupProcessed();
-	size_t ProcStatusCount(ProcStatus status = ProcStatus::None);
 
     public:
 	static std::unique_ptr<VCoproc> Create(
@@ -556,34 +577,6 @@ VCoproc::~VCoproc()
 	}
 }
 
-size_t
-VCoproc::ProcStatusCount(ProcStatus status)
-{
-	std::stringstream ss;
-	int ret, val;
-
-	ss << "SELECT count(*) FROM proc";
-	if (status != ProcStatus::None) {
-		ss << " WHERE status = " << static_cast<int>(status);
-	}
-
-	auto curs = dbconn->SelectStmt(ss, verbose);
-	if (curs == nullptr) {
-		return 0;
-	}
-
-	ret = curs->NextRow();
-	if (ret < 0) {
-		return ret;
-	}
-	assert(ret > 0);
-
-	curs->RowColumn(0, val);
-	assert(val >= 0);
-
-	return static_cast<size_t>(val);
-}
-
 /*
  * Sleep for a given number of milliseconds. On error, -1 is returned.
  * If the loop was stopped during the sleep, it returns 1.
@@ -632,11 +625,6 @@ int
 VCoproc::FetchMoreFiles()
 {
 	int credits = MaxEntries;
-
-	if (ProcStatusCount() >= MaxEntries) {
-		/* Nothing to do. */
-		return 0;
-	}
 
 	assert(input_dir_idx < input_dirs.size());
 
@@ -752,20 +740,10 @@ VCoproc::FetchFilesFromDir(const std::string &dirname,
 		 */
 		std::stringstream qss;
 
-		qss << "SELECT * FROM proc WHERE src_path = \"" << path << "\"";
-		auto curs = dbconn->SelectStmt(qss, verbose);
-		if (curs == nullptr) {
-			break;
-		}
-		if (curs->NextRow() == 0) {
-			/* No available. */
-			qss = std::stringstream();
-			qss << "INSERT INTO proc (src_path, status) VALUES "
-			       "(\""
-			    << path << "\","
-			    << static_cast<int>(ProcStatus::New) << ")";
-			if (dbconn->ModifyStmt(qss, verbose)) {
-				break;
+		if (!pending.count(path)) {
+			pending[path] = std::move(PendingProc::Create(curlm, path));
+			if (verbose) {
+				std::cout << "New file " << path << std::endl;
 			}
 		}
 		credits--;
@@ -800,10 +778,11 @@ VCoproc::MainLoop()
 		base_url = u.str();
 	}
 
+	int num_running_curls = 0, numfds = 0;
 	for (;;) {
 		/*
 		 * First, remove any completed or failed entries
-		 * from the proc table, to make space for new
+		 * from the pending, to make space for new
 		 * files.
 		 */
 		err = CleanupProcessed();
@@ -812,7 +791,7 @@ VCoproc::MainLoop()
 		}
 
 		/*
-		 * Refill the proc table by fetching more files from the
+		 * Refill the pending table by fetching more files from the
 		 * input directories.
 		 */
 		err = FetchMoreFiles();
@@ -821,49 +800,60 @@ VCoproc::MainLoop()
 		}
 
 		/*
-		 * Fetch any new entries and prepare a POST request to
+		 * Scan any new entries and prepare a POST request to
 		 * submit to the backend engine.
 		 */
-		{
-			std::stringstream qss;
-			int ret;
-
-			qss << "SELECT src_path FROM proc WHERE status = "
-			    << static_cast<int>(ProcStatus::New);
-
-			auto curs_new = dbconn->SelectStmt(qss, verbose);
-			if (curs_new == nullptr) {
-				break;
-			}
-
-			while ((ret = curs_new->NextRow()) > 0) {
-				std::string src_path;
-
-				curs_new->RowColumn(0, src_path);
-				pending[src_path] = std::move(
-				    PendingProc::Create(curlm, src_path));
-				auto &pproc = pending[src_path];
-				if (pproc == nullptr) {
-					continue; /* skip it for now */
-				}
-
-				json11::Json jsreq = json11::Json::object{
-				    {"file_name", src_path},
-				};
-				if (pproc->PreparePost(base_url + "/process",
-						       jsreq)) {
-					continue;
-				}
-			}
-		}
-
 		for (auto &kv : pending) {
-			if (kv.second->Status() ==
-			    PendingProc::CurlStatus::Prepared) {
-				std::cout << "Sholud submit " << std::endl;
+			auto& proc = kv.second;
+
+			if (proc->Status() != ProcStatus::New) {
+				continue;
+			}
+
+			json11::Json jsreq = json11::Json::object{
+			    {"file_name", proc->FilePath()},
+			};
+			if (proc->PreparePost(base_url + "/process",
+					       jsreq)) {
+				continue;
+			}
+			proc->SetStatus(ProcStatus::InProgress);
+		}
+
+		/* Advance any pending POST transfers. */
+		CURLMcode cm = curl_multi_perform(curlm, &num_running_curls);
+		if (cm != CURLM_OK) {
+			std::cerr << "Failed to perform multi handle: "
+				<< curl_multi_strerror(cm) << std::endl;
+			break;
+		}
+		std::cout << "still running " << num_running_curls << std::endl;
+
+		/* Wait for any activity on a POST transfer. */
+		cm = curl_multi_wait(curlm, NULL, 0, 1000, &numfds);
+		if (cm != CURLM_OK) {
+			std::cerr << "Failed to wait multi handle: "
+				<< curl_multi_strerror(cm) << std::endl;
+			break;
+		}
+		std::cout << "numfds " << numfds << std::endl;
+
+		int msgs_left = -1;
+		CURLMsg *msg;
+
+		while ((msg = curl_multi_info_read(curlm, &msgs_left)) != nullptr) {
+			if (msg->msg == CURLMSG_DONE) {
+				PendingProc *p;
+				curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, (char **)&p);
+				std::cout << "Completed " << p->FilePath() << std::endl;
+				p->SetStatus(ProcStatus::Completed);
+				//pending.erase(p->FilePath());
+			} else {
+				std::cout << logb(LogInf) << "Got CURLM msg " << msg->msg << std::endl;
 			}
 		}
 
+#if 0
 		if (ProcStatusCount(ProcStatus::New) == 0) {
 			/*
 			 * No files to process. In monitor mode, sleep for
@@ -886,7 +876,10 @@ VCoproc::MainLoop()
 		std::cout << "I could process "
 			  << ProcStatusCount(ProcStatus::New) << " files"
 			  << std::endl;
-		break;
+#endif
+		if (num_running_curls == 0) {
+			break;
+		}
 	}
 
 	return err;
@@ -1003,6 +996,8 @@ main(int argc, char **argv)
 			break;
 		}
 	}
+
+	curl_global_init(CURL_GLOBAL_ALL);
 
 	auto vcoproc = VCoproc::Create(
 	    stopfd_global, verbose, consume, monitor, std::move(input_dirs),
