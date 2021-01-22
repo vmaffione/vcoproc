@@ -275,25 +275,25 @@ SQLiteDbConn::SelectStmt(const std::stringstream &ss, bool verbose)
 }
 
 enum class ProcStatus {
-	None	   = 0,
-	New	   = 1,
-	InProgress = 2,
-	Completed  = 3,
-	Failed	   = 4,
+	None	 = 0,
+	New	 = 1,
+	Waiting	 = 2,
+	Success	 = 3,
+	Failure	 = 4,
+	Complete = 5,
 };
 
 /*
  * A class representing an entry in the pending table.
  */
 class PendingProc {
-public:
+    public:
 	enum class CurlStatus {
 		Idle	 = 0,
 		Prepared = 1,
-		Waiting	 = 2,
 	};
 
-private:
+    private:
 	CURLM *curlm = nullptr;
 	CURL *curl   = nullptr;
 	std::string src_path;
@@ -316,6 +316,7 @@ private:
 	static std::unique_ptr<PendingProc> Create(CURLM *curlm,
 						   const std::string &src_path);
 	int PreparePost(const std::string &url, const json11::Json &jsreq);
+	int PostCompleted();
 };
 
 std::unique_ptr<PendingProc>
@@ -343,7 +344,8 @@ PendingProc::Create(CURLM *curlm, const std::string &src_path)
 
 	auto proc = std::make_unique<PendingProc>(curlm, curl, src_path);
 
-	CURLcode cc = curl_easy_setopt(curl, CURLOPT_PRIVATE, (void *)proc.get());
+	CURLcode cc =
+	    curl_easy_setopt(curl, CURLOPT_PRIVATE, (void *)proc.get());
 	if (cc != CURLE_OK) {
 		std::cerr << "Failed to set CURLOPT_PRIVATE: "
 			  << curl_easy_strerror(cc) << std::endl;
@@ -351,7 +353,6 @@ PendingProc::Create(CURLM *curlm, const std::string &src_path)
 	}
 
 	return proc;
-
 }
 
 PendingProc::~PendingProc()
@@ -395,7 +396,7 @@ PendingProc::PreparePost(const std::string &url, const json11::Json &jsreq)
 	 * end of the POST transfer.
 	 */
 	postdata = jsreq.dump();
-	cc = curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postdata.c_str());
+	cc	 = curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postdata.c_str());
 	if (cc != CURLE_OK) {
 		std::cerr << "Failed to set CURLOPT_POSTFIELDS: "
 			  << curl_easy_strerror(cc) << std::endl;
@@ -435,6 +436,18 @@ PendingProc::PreparePost(const std::string &url, const json11::Json &jsreq)
 	return 0;
 }
 
+int
+PendingProc::PostCompleted()
+{
+	if (curl_status != CurlStatus::Prepared) {
+		return -1;
+	}
+
+	curl_status = CurlStatus::Idle;
+
+	return 0;
+}
+
 /* Main class. */
 class VCoproc {
 	int stopfd   = -1; /* owned by the caller, not by us */
@@ -463,7 +476,7 @@ class VCoproc {
 	int FetchMoreFiles();
 	int FetchFilesFromDir(const std::string &dir,
 			      std::deque<std::string> &frontier, int &credits);
-	int CleanupProcessed();
+	int CleanupComplete();
 
     public:
 	static std::unique_ptr<VCoproc> Create(
@@ -741,7 +754,8 @@ VCoproc::FetchFilesFromDir(const std::string &dirname,
 		std::stringstream qss;
 
 		if (!pending.count(path)) {
-			pending[path] = std::move(PendingProc::Create(curlm, path));
+			pending[path] =
+			    std::move(PendingProc::Create(curlm, path));
 			if (verbose) {
 				std::cout << "New file " << path << std::endl;
 			}
@@ -755,14 +769,24 @@ VCoproc::FetchFilesFromDir(const std::string &dirname,
 }
 
 int
-VCoproc::CleanupProcessed()
+VCoproc::CleanupComplete()
 {
 	std::stringstream qss;
 
-	qss << "DELETE FROM proc WHERE status = "
-	    << static_cast<int>(ProcStatus::Completed)
-	    << " OR status = " << static_cast<int>(ProcStatus::Failed);
-	return dbconn->ModifyStmt(qss, verbose);
+	for (auto it = pending.begin(); it != pending.end();) {
+		auto &proc = it->second;
+
+		if (proc->Status() == ProcStatus::Complete) {
+			std::cout << logb(LogDbg) << "Completed "
+				  << proc->FilePath() << std::endl;
+			++it;
+			// it = pending.erase(it);
+		} else {
+			++it;
+		}
+	}
+
+	return 0;
 }
 
 int
@@ -785,7 +809,7 @@ VCoproc::MainLoop()
 		 * from the pending, to make space for new
 		 * files.
 		 */
-		err = CleanupProcessed();
+		err = CleanupComplete();
 		if (err) {
 			break;
 		}
@@ -804,7 +828,7 @@ VCoproc::MainLoop()
 		 * submit to the backend engine.
 		 */
 		for (auto &kv : pending) {
-			auto& proc = kv.second;
+			auto &proc = kv.second;
 
 			if (proc->Status() != ProcStatus::New) {
 				continue;
@@ -813,43 +837,70 @@ VCoproc::MainLoop()
 			json11::Json jsreq = json11::Json::object{
 			    {"file_name", proc->FilePath()},
 			};
-			if (proc->PreparePost(base_url + "/process",
-					       jsreq)) {
+			if (proc->PreparePost(base_url + "/process", jsreq)) {
 				continue;
 			}
-			proc->SetStatus(ProcStatus::InProgress);
+			proc->SetStatus(ProcStatus::Waiting);
 		}
 
 		/* Advance any pending POST transfers. */
 		CURLMcode cm = curl_multi_perform(curlm, &num_running_curls);
 		if (cm != CURLM_OK) {
 			std::cerr << "Failed to perform multi handle: "
-				<< curl_multi_strerror(cm) << std::endl;
+				  << curl_multi_strerror(cm) << std::endl;
 			break;
 		}
-		std::cout << "still running " << num_running_curls << std::endl;
 
 		/* Wait for any activity on a POST transfer. */
 		cm = curl_multi_wait(curlm, NULL, 0, 1000, &numfds);
 		if (cm != CURLM_OK) {
 			std::cerr << "Failed to wait multi handle: "
-				<< curl_multi_strerror(cm) << std::endl;
+				  << curl_multi_strerror(cm) << std::endl;
 			break;
 		}
-		std::cout << "numfds " << numfds << std::endl;
 
+		/* Process any completed transfers. */
 		int msgs_left = -1;
 		CURLMsg *msg;
 
-		while ((msg = curl_multi_info_read(curlm, &msgs_left)) != nullptr) {
-			if (msg->msg == CURLMSG_DONE) {
-				PendingProc *p;
-				curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE, (char **)&p);
-				std::cout << "Completed " << p->FilePath() << std::endl;
-				p->SetStatus(ProcStatus::Completed);
-				//pending.erase(p->FilePath());
+		while ((msg = curl_multi_info_read(curlm, &msgs_left)) !=
+		       nullptr) {
+			PendingProc *p;
+			long http_code;
+			CURLcode cc;
+
+			if (msg->msg != CURLMSG_DONE) {
+				std::cout << logb(LogInf) << "Got CURLM msg "
+					  << msg->msg << std::endl;
+			}
+
+			cc = curl_easy_getinfo(msg->easy_handle,
+					       CURLINFO_PRIVATE, (char **)&p);
+			if (cc != CURLE_OK) {
+				std::cerr << "Failed to get CURLINFO_PRIVATE: "
+					  << curl_easy_strerror(cc)
+					  << std::endl;
+				continue;
+			}
+
+			int ret = p->PostCompleted();
+			assert(ret == 0);
+
+			cc = curl_easy_getinfo(msg->easy_handle,
+					       CURLINFO_RESPONSE_CODE,
+					       &http_code);
+			if (cc != CURLE_OK) {
+				std::cerr
+				    << "Failed to get CURLINFO_RESPONSE_CODE: "
+				    << curl_easy_strerror(cc) << std::endl;
+				http_code = 400;
+			}
+			std::cout << "Completed " << p->FilePath() << " --> "
+				  << http_code << std::endl;
+			if (http_code == 200) {
+				p->SetStatus(ProcStatus::Success);
 			} else {
-				std::cout << logb(LogInf) << "Got CURLM msg " << msg->msg << std::endl;
+				p->SetStatus(ProcStatus::Failure);
 			}
 		}
 
