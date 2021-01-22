@@ -301,6 +301,7 @@ class PendingProc {
 
 	CurlStatus curl_status = CurlStatus::Idle;
 	ProcStatus proc_status = ProcStatus::New;
+	std::stringstream postresp;
 
     public:
 	PendingProc(CURLM *curlm, CURL *curl, const std::string &src_path)
@@ -315,13 +316,17 @@ class PendingProc {
 	std::string FilePath() const { return src_path; }
 	static std::unique_ptr<PendingProc> Create(CURLM *curlm,
 						   const std::string &src_path);
+	static size_t CurlWriteCallback(void *data, size_t size, size_t nmemb,
+					void *userp);
+	void AppendResponse(void *data, size_t size);
 	int PreparePost(const std::string &url, const json11::Json &jsreq);
-	int PostCompleted();
+	int CompletePost(json11::Json &jsresp);
 };
 
 std::unique_ptr<PendingProc>
 PendingProc::Create(CURLM *curlm, const std::string &src_path)
 {
+	CURLcode cc;
 	CURL *curl;
 
 	if (curlm == nullptr) {
@@ -335,6 +340,16 @@ PendingProc::Create(CURLM *curlm, const std::string &src_path)
 		return nullptr;
 	}
 
+	/* Set our write callback. */
+	cc = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
+			      &PendingProc::CurlWriteCallback);
+	if (cc != CURLE_OK) {
+		std::cerr << "Failed to set CURLOPT_WRITEFUNCTION: "
+			  << curl_easy_strerror(cc) << std::endl;
+		return nullptr;
+	}
+
+	/* Add this handle to our multi stack. */
 	CURLMcode cm = curl_multi_add_handle(curlm, curl);
 	if (cm != CURLM_OK) {
 		std::cerr << "Failed to add handle to multi stack: "
@@ -344,10 +359,18 @@ PendingProc::Create(CURLM *curlm, const std::string &src_path)
 
 	auto proc = std::make_unique<PendingProc>(curlm, curl, src_path);
 
-	CURLcode cc =
-	    curl_easy_setopt(curl, CURLOPT_PRIVATE, (void *)proc.get());
+	/* Link the new PendingProc instance to the curl handle. */
+	cc = curl_easy_setopt(curl, CURLOPT_PRIVATE, (void *)proc.get());
 	if (cc != CURLE_OK) {
 		std::cerr << "Failed to set CURLOPT_PRIVATE: "
+			  << curl_easy_strerror(cc) << std::endl;
+		return nullptr;
+	}
+
+	/* Link the new PendingProc instance to our write callback. */
+	cc = curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)proc.get());
+	if (cc != CURLE_OK) {
+		std::cerr << "Failed to set CURLOPT_WRITEDATA: "
 			  << curl_easy_strerror(cc) << std::endl;
 		return nullptr;
 	}
@@ -369,6 +392,25 @@ PendingProc::~PendingProc()
 		}
 		curl_easy_cleanup(curl);
 	}
+}
+
+size_t
+PendingProc::CurlWriteCallback(void *data, size_t size, size_t nmemb,
+			       void *userp)
+{
+	size_t chunksz	  = size * nmemb;
+	PendingProc *proc = reinterpret_cast<PendingProc *>(userp);
+
+	assert(proc != nullptr);
+	proc->AppendResponse(data, chunksz);
+
+	return chunksz;
+}
+
+void
+PendingProc::AppendResponse(void *data, size_t size)
+{
+	postresp.write((const char *)data, size);
 }
 
 /* Prepare a post request without performing it. */
@@ -437,13 +479,25 @@ PendingProc::PreparePost(const std::string &url, const json11::Json &jsreq)
 }
 
 int
-PendingProc::PostCompleted()
+PendingProc::CompletePost(json11::Json &jsresp)
 {
+	std::string errs;
+
 	if (curl_status != CurlStatus::Prepared) {
 		return -1;
 	}
 
+	jsresp = json11::Json::parse(postresp.str(), errs);
+	if (!errs.empty() && jsresp == json11::Json()) {
+		std::cerr << logb(LogErr)
+			  << "Response is not a JSON: " << postresp.str()
+			  << std::endl;
+		return -1;
+	}
+
+	/* Reset CURL status to allow more requests. */
 	curl_status = CurlStatus::Idle;
+	postresp    = std::stringstream();
 
 	return 0;
 }
@@ -757,7 +811,8 @@ VCoproc::FetchFilesFromDir(const std::string &dirname,
 			pending[path] =
 			    std::move(PendingProc::Create(curlm, path));
 			if (verbose) {
-				std::cout << "New file " << path << std::endl;
+				std::cout << logb(LogDbg) << "New file " << path
+					  << std::endl;
 			}
 		}
 		credits--;
@@ -862,7 +917,6 @@ VCoproc::MainLoop()
 		/* Process any completed transfers. */
 		int msgs_left = -1;
 		CURLMsg *msg;
-
 		while ((msg = curl_multi_info_read(curlm, &msgs_left)) !=
 		       nullptr) {
 			PendingProc *p;
@@ -883,9 +937,6 @@ VCoproc::MainLoop()
 				continue;
 			}
 
-			int ret = p->PostCompleted();
-			assert(ret == 0);
-
 			cc = curl_easy_getinfo(msg->easy_handle,
 					       CURLINFO_RESPONSE_CODE,
 					       &http_code);
@@ -895,20 +946,26 @@ VCoproc::MainLoop()
 				    << curl_easy_strerror(cc) << std::endl;
 				http_code = 400;
 			}
-			std::cout << "Completed " << p->FilePath() << " --> "
-				  << http_code << std::endl;
-			if (http_code == 200) {
-				p->SetStatus(ProcStatus::Success);
-			} else {
+
+			json11::Json jsresp;
+			int ret = p->CompletePost(jsresp);
+
+			std::cout << logb(LogDbg) << "Completed "
+				  << p->FilePath() << " --> " << http_code
+				  << " " << jsresp.dump() << std::endl;
+
+			if (ret || http_code != 200) {
 				p->SetStatus(ProcStatus::Failure);
+			} else {
+				p->SetStatus(ProcStatus::Success);
 			}
 		}
 
-#if 0
-		if (ProcStatusCount(ProcStatus::New) == 0) {
+		if (num_running_curls == 0) {
 			/*
-			 * No files to process. In monitor mode, sleep for
-			 * a little bit. Otherwise just stop.
+			 * No more files to be processed or pending
+			 * activities. In monitor mode, sleep for a
+			 * little bit. Otherwise just stop.
 			 */
 			if (!monitor) {
 				break;
@@ -924,10 +981,6 @@ VCoproc::MainLoop()
 			continue;
 		}
 
-		std::cout << "I could process "
-			  << ProcStatusCount(ProcStatus::New) << " files"
-			  << std::endl;
-#endif
 		if (num_running_curls == 0) {
 			break;
 		}
