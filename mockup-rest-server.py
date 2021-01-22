@@ -88,6 +88,7 @@ class TestRequestHandler(myhttp.RequestHandler):
                 # Read the request body and parse it as JSON.
                 reqbody = self.rfile.read(content_length)
                 reqbody = reqbody.decode('utf8')
+                print(f"Received request {reqbody}")
                 try:
                         jsreq = json.loads(reqbody)
                 except Exception as e:

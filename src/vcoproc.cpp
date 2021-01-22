@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <curl/curl.h>
 #include <deque>
 #include <dirent.h>
 #include <iostream>
@@ -13,6 +14,7 @@
 #include <sys/eventfd.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 #include <utils.hpp>
@@ -78,8 +80,8 @@ class SQLiteDbCursor {
 	~SQLiteDbCursor();
 	int NextRow();
 	bool RowColumnCheck(unsigned int idx);
-	bool RowColumn(unsigned int idx, int &val);
-	bool RowColumn(unsigned int idx, std::string &s);
+	bool RowColumn(unsigned int idx, int &val, bool mayfail = false);
+	bool RowColumn(unsigned int idx, std::string &s, bool mayfail = false);
 };
 
 SQLiteDbCursor::~SQLiteDbCursor()
@@ -143,9 +145,10 @@ SQLiteDbCursor::RowColumnCheck(unsigned int idx)
 }
 
 bool
-SQLiteDbCursor::RowColumn(unsigned int idx, int &val)
+SQLiteDbCursor::RowColumn(unsigned int idx, int &val, bool mayfail)
 {
 	if (!RowColumnCheck(idx)) {
+		assert(mayfail);
 		return false;
 	}
 
@@ -155,9 +158,10 @@ SQLiteDbCursor::RowColumn(unsigned int idx, int &val)
 }
 
 bool
-SQLiteDbCursor::RowColumn(unsigned int idx, std::string &s)
+SQLiteDbCursor::RowColumn(unsigned int idx, std::string &s, bool mayfail)
 {
 	if (!RowColumnCheck(idx)) {
+		assert(mayfail);
 		return false;
 	}
 
@@ -266,6 +270,95 @@ SQLiteDbConn::SelectStmt(const std::stringstream &ss, bool verbose)
 	return std::make_unique<SQLiteDbCursor>(dbh, pstmt);
 }
 
+/*
+ * A class representing a pending entry in the proc table.
+ */
+class PendingProc {
+	bool curl_pending = false;
+	std::string src_path;
+	CURL *curl;
+
+    public:
+	PendingProc(const std::string &src_path, CURL *curl)
+	    : src_path(src_path), curl(curl)
+	{
+	}
+	~PendingProc()
+	{
+		if (curl != nullptr) {
+			curl_easy_cleanup(curl);
+		}
+	}
+	static std::unique_ptr<PendingProc> Create(const std::string &src_path);
+	int PreparePost(const std::string &url, const std::string &data);
+};
+
+std::unique_ptr<PendingProc>
+PendingProc::Create(const std::string &src_path)
+{
+	CURL *curl;
+
+	curl = curl_easy_init();
+	if (curl == nullptr) {
+		return nullptr;
+	}
+
+	return std::make_unique<PendingProc>(src_path, curl);
+}
+
+/* Prepare a post request without performing it. */
+int
+PendingProc::PreparePost(const std::string &url, const std::string &data)
+{
+	CURLcode cc;
+
+	cc = curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+	if (cc != CURLE_OK) {
+		std::cerr << "Failed to set CURLOPT_URL: "
+			  << curl_easy_strerror(cc) << std::endl;
+		return -1;
+	}
+
+	cc = curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data.c_str());
+	if (cc != CURLE_OK) {
+		std::cerr << "Failed to set CURLOPT_POSTFIELDS: "
+			  << curl_easy_strerror(cc) << std::endl;
+		return -1;
+	}
+
+	/*
+	 * If we don't provide POSTFIELDSIZE, libcurl will strlen() by
+	 * itself.
+	 */
+	cc = curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, data.size());
+	if (cc != CURLE_OK) {
+		std::cerr << "Failed to set CURLOPT_POSTFIELDSIZE: "
+			  << curl_easy_strerror(cc) << std::endl;
+		return -1;
+	}
+
+#if 0
+	cc = curl_easy_perform(curl);
+	if (cc != CURLE_OK) {
+		std::cerr << "Failed to perform request: "
+			  << curl_easy_strerror(cc) << std::endl;
+		return -1;
+	} else {
+		long code = 0;
+		cc = curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+		if (cc != CURLE_OK) {
+			std::cerr << "Failed to get CURLINFO_RESPONSE_CODE: "
+				<< curl_easy_strerror(cc) << std::endl;
+			return -1;
+		}
+		std::cout << "REQUEST DONE: " << code << std::endl;
+	}
+#endif
+
+	return 0;
+}
+
+/* Main class. */
 class VCoproc {
 	int stopfd   = -1; /* owned by the caller, not by us */
 	bool verbose = false;
@@ -291,11 +384,8 @@ class VCoproc {
 	 */
 	static constexpr size_t MaxEntries = 5;
 
-	struct InputFileInfo {
-		std::string filepath;
-		std::string filesubpath;
-		unsigned int dir_idx;
-	};
+	/* Map of in-progress proc entries. */
+	std::unordered_map<std::string, std::unique_ptr<PendingProc>> pending;
 
 	int StoppableSleep(int milliseconds);
 	int FetchMoreFiles();
@@ -398,8 +488,7 @@ VCoproc::ProcStatusCount(ProcStatus status)
 	}
 	assert(ret > 0);
 
-	ret = curs->RowColumn(0, val);
-	assert(ret);
+	curs->RowColumn(0, val);
 	assert(val >= 0);
 
 	return static_cast<size_t>(val);
@@ -631,6 +720,44 @@ VCoproc::MainLoop()
 		err = FetchMoreFiles();
 		if (err) {
 			break;
+		}
+
+		/*
+		 * Fetch any new entries and submit a POST request to
+		 * the backend engine.
+		 */
+		{
+			std::stringstream qss;
+			int ret;
+
+			qss << "SELECT src_path FROM proc WHERE status = "
+			    << static_cast<int>(ProcStatus::New);
+
+			auto curs_new = dbconn->SelectStmt(qss, verbose);
+			if (curs_new == nullptr) {
+				break;
+			}
+
+			while ((ret = curs_new->NextRow()) > 0) {
+				std::string src_path;
+
+				curs_new->RowColumn(0, src_path);
+				pending[src_path] =
+				    std::move(PendingProc::Create(src_path));
+				auto &pproc = pending[src_path];
+				if (pproc == nullptr) {
+					continue; /* skip it for now */
+				}
+
+				std::stringstream data;
+				data << "{\"src_path\": \"" << src_path
+				     << "\"}";
+				if (pproc->PreparePost(
+					"http://localhost:5000/process",
+					data.str())) {
+					continue;
+				}
+			}
 		}
 
 		if (ProcStatusCount(ProcStatus::New) == 0) {
