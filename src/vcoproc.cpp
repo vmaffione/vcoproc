@@ -210,6 +210,10 @@ SQLiteDbConn::~SQLiteDbConn()
 int
 SQLiteDbConn::ModifyStmt(const std::stringstream &ss, bool verbose)
 {
+	if (verbose) {
+		std::cout << "Q: " << ss.str() << std::endl;
+	}
+
 	sqlite3_stmt *pstmt;
 	int ret = sqlite3_prepare_v2(dbh, ss.str().c_str(), /*nByte=*/-1,
 				     &pstmt, /*pzTail=*/nullptr);
@@ -243,6 +247,10 @@ SQLiteDbConn::ModifyStmt(const std::stringstream &ss, bool verbose)
 std::unique_ptr<SQLiteDbCursor>
 SQLiteDbConn::SelectStmt(const std::stringstream &ss, bool verbose)
 {
+	if (verbose) {
+		std::cout << "Q: " << ss.str() << std::endl;
+	}
+
 	sqlite3_stmt *pstmt;
 	int ret = sqlite3_prepare_v2(dbh, ss.str().c_str(), /*nByte=*/-1,
 				     &pstmt, /*pzTail=*/nullptr);
@@ -293,6 +301,7 @@ class VCoproc {
 	int FetchMoreFiles();
 	int FetchFilesFromDir(const std::string &dir,
 			      std::deque<std::string> &frontier, int &credits);
+	int CleanupProcessed();
 	size_t ProcStatusCount(ProcStatus status = ProcStatus::None);
 
     public:
@@ -379,6 +388,9 @@ VCoproc::ProcStatusCount(ProcStatus status)
 	}
 
 	auto curs = dbconn->SelectStmt(ss, verbose);
+	if (curs == nullptr) {
+		return 0;
+	}
 
 	ret = curs->NextRow();
 	if (ret < 0) {
@@ -391,49 +403,6 @@ VCoproc::ProcStatusCount(ProcStatus status)
 	assert(val >= 0);
 
 	return static_cast<size_t>(val);
-}
-
-int
-VCoproc::MainLoop()
-{
-	int err = 0;
-
-	for (;;) {
-		/* Fetch the next file from one of the input directories. */
-		int ret;
-
-		ret = FetchMoreFiles();
-		if (ret < 0) {
-			err = ret;
-			break;
-		}
-
-		if (ProcStatusCount(ProcStatus::New) == 0) {
-			/*
-			 * No files to process. In monitor mode, sleep for
-			 * a little bit. Otherwise just stop.
-			 */
-			if (!monitor) {
-				break;
-			}
-
-			if (StoppableSleep(3000) > 0) {
-				std::cout << logb(LogInf)
-					  << "Stopping the main loop"
-					  << std::endl
-					  << std::flush;
-				break;
-			}
-			continue;
-		}
-
-		std::cout << "I could process "
-			  << ProcStatusCount(ProcStatus::New) << " files"
-			  << std::endl;
-		break;
-	}
-
-	return err;
 }
 
 /*
@@ -483,9 +452,9 @@ VCoproc::StoppableSleep(int milliseconds)
 int
 VCoproc::FetchMoreFiles()
 {
-	int credits = MaxEntries - ProcStatusCount();
+	int credits = MaxEntries;
 
-	if (credits <= 0) {
+	if (ProcStatusCount() >= MaxEntries) {
 		/* Nothing to do. */
 		return 0;
 	}
@@ -599,16 +568,26 @@ VCoproc::FetchFilesFromDir(const std::string &dirname,
 
 		/*
 		 * We got a file good for processing. Insert it into the
-		 * database and decrease the credits.
+		 * database (if it's not already there) and decrease the
+		 * credits.
 		 */
 		std::stringstream qss;
 
-		qss << "INSERT OR REPLACE INTO proc (src_path, status) VALUES "
-		       "(\""
-		    << path << "\"," << static_cast<int>(ProcStatus::New)
-		    << ")";
-		if (dbconn->ModifyStmt(qss, verbose)) {
+		qss << "SELECT * FROM proc WHERE src_path = \"" << path << "\"";
+		auto curs = dbconn->SelectStmt(qss, verbose);
+		if (curs == nullptr) {
 			break;
+		}
+		if (curs->NextRow() == 0) {
+			/* No available. */
+			qss = std::stringstream();
+			qss << "INSERT INTO proc (src_path, status) VALUES "
+			       "(\""
+			    << path << "\","
+			    << static_cast<int>(ProcStatus::New) << ")";
+			if (dbconn->ModifyStmt(qss, verbose)) {
+				break;
+			}
 		}
 		credits--;
 	}
@@ -616,6 +595,70 @@ VCoproc::FetchFilesFromDir(const std::string &dirname,
 	closedir(dir);
 
 	return 0;
+}
+
+int
+VCoproc::CleanupProcessed()
+{
+	std::stringstream qss;
+
+	qss << "DELETE FROM proc WHERE status = "
+	    << static_cast<int>(ProcStatus::Completed)
+	    << " OR status = " << static_cast<int>(ProcStatus::Failed);
+	return dbconn->ModifyStmt(qss, verbose);
+}
+
+int
+VCoproc::MainLoop()
+{
+	int err = 0;
+
+	for (;;) {
+		/*
+		 * First, remove any completed or failed entries
+		 * from the proc table, to make space for new
+		 * files.
+		 */
+		err = CleanupProcessed();
+		if (err) {
+			break;
+		}
+
+		/*
+		 * Refill the proc table by fetching more files from the
+		 * input directories.
+		 */
+		err = FetchMoreFiles();
+		if (err) {
+			break;
+		}
+
+		if (ProcStatusCount(ProcStatus::New) == 0) {
+			/*
+			 * No files to process. In monitor mode, sleep for
+			 * a little bit. Otherwise just stop.
+			 */
+			if (!monitor) {
+				break;
+			}
+
+			if (StoppableSleep(3000) > 0) {
+				std::cout << logb(LogInf)
+					  << "Stopping the main loop"
+					  << std::endl
+					  << std::flush;
+				break;
+			}
+			continue;
+		}
+
+		std::cout << "I could process "
+			  << ProcStatusCount(ProcStatus::New) << " files"
+			  << std::endl;
+		break;
+	}
+
+	return err;
 }
 
 int
