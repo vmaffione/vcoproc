@@ -27,22 +27,25 @@ namespace {
 void
 Usage(const char *progname)
 {
-	std::cout << progname << " usage:" << std::endl
-		  << "    -h (show this help and exit)" << std::endl
-		  << "    -V (print version info and exit)" << std::endl
-		  << "    -v (increase verbosity level)" << std::endl
-		  << "    -i INPUT_DIR (add directory to look for files)"
-		  << std::endl
-		  << "    -o OUTPUT_DIR (directory to store "
-		     "incoming files)"
-		  << std::endl
-		  << "    -D DB_FILE (path to the sqlite3 database file)"
-		  << std::endl
-		  << "    -c (consume input files)" << std::endl
-		  << "    -m (monitor input directories rather than stop when "
-		     "running out of files)"
-		  << std::endl
-		  << std::endl;
+	std::cout
+	    << progname << " usage:" << std::endl
+	    << "    -h (show this help and exit)" << std::endl
+	    << "    -V (print version info and exit)" << std::endl
+	    << "    -v (increase verbosity level)" << std::endl
+	    << "    -i INPUT_DIR (add directory to look for files)" << std::endl
+	    << "    -o OUTPUT_DIR (directory to store "
+	       "incoming files)"
+	    << std::endl
+	    << "    -D DB_FILE (path to the sqlite3 database file)" << std::endl
+	    << "    -c (consume input files)" << std::endl
+	    << "    -m (monitor input directories rather than stop when "
+	       "running out of files)"
+	    << "    -H BACKEND_HOST (address or name of the backend engine)"
+	    << std::endl
+	    << "    -p BACKEND_PORT (TCP port of the backend engine)"
+	    << std::endl
+	    << std::endl
+	    << std::endl;
 }
 
 void
@@ -368,6 +371,8 @@ class VCoproc {
 	std::string output_dir;
 	std::string dbfile;
 	std::unique_ptr<SQLiteDbConn> dbconn;
+	std::string host;
+	unsigned short port  = 0;
 	size_t input_dir_idx = 0;
 
 	enum class ProcStatus {
@@ -398,18 +403,19 @@ class VCoproc {
 	static std::unique_ptr<VCoproc> Create(
 	    int stopfd, bool verbose, bool consume, bool monitor,
 	    std::vector<std::string> input_dirs, std::string output_dir,
-	    std::string dbfile);
+	    std::string dbfile, std::string host, unsigned short port);
 
 	VCoproc(int stopfd, bool verbose, bool consume, bool monitor,
 		std::vector<std::string> input_dirs, std::string output_dir,
-		std::string dbfile, std::unique_ptr<SQLiteDbConn> dbconn);
+		std::string dbfile, std::unique_ptr<SQLiteDbConn> dbconn,
+		std::string host, unsigned short port);
 	int MainLoop();
 };
 
 std::unique_ptr<VCoproc>
 VCoproc::Create(int stopfd, bool verbose, bool consume, bool monitor,
 		std::vector<std::string> input_dirs, std::string output_dir,
-		std::string dbfile)
+		std::string dbfile, std::string host, unsigned short port)
 {
 	if (input_dirs.empty()) {
 		std::cerr << logb(LogErr) << "No input directories specified"
@@ -426,6 +432,17 @@ VCoproc::Create(int stopfd, bool verbose, bool consume, bool monitor,
 	if (dbfile.empty()) {
 		std::cerr << logb(LogErr) << "No database file specified"
 			  << std::endl;
+		return nullptr;
+	}
+
+	if (host.empty()) {
+		std::cerr << logb(LogErr) << "No hostname specified"
+			  << std::endl;
+		return nullptr;
+	}
+
+	if (port == 0) {
+		std::cerr << logb(LogErr) << "No port specified" << std::endl;
 		return nullptr;
 	}
 
@@ -449,12 +466,14 @@ VCoproc::Create(int stopfd, bool verbose, bool consume, bool monitor,
 
 	return std::make_unique<VCoproc>(
 	    stopfd, verbose, consume, monitor, std::move(input_dirs),
-	    std::move(output_dir), std::move(dbfile), std::move(dbconn));
+	    std::move(output_dir), std::move(dbfile), std::move(dbconn),
+	    std::move(host), port);
 }
 
 VCoproc::VCoproc(int stopfd, bool verbose, bool consume, bool monitor,
 		 std::vector<std::string> input_dirs, std::string output_dir,
-		 std::string dbfile, std::unique_ptr<SQLiteDbConn> dbconn)
+		 std::string dbfile, std::unique_ptr<SQLiteDbConn> dbconn,
+		 std::string host, unsigned short port)
     : stopfd(stopfd),
       verbose(verbose),
       consume(consume),
@@ -462,7 +481,9 @@ VCoproc::VCoproc(int stopfd, bool verbose, bool consume, bool monitor,
       input_dirs(std::move(input_dirs)),
       output_dir(std::move(output_dir)),
       dbfile(std::move(dbfile)),
-      dbconn(std::move(dbconn))
+      dbconn(std::move(dbconn)),
+      host(std::move(host)),
+      port(port)
 {
 }
 
@@ -700,7 +721,15 @@ VCoproc::CleanupProcessed()
 int
 VCoproc::MainLoop()
 {
+	std::string base_url;
 	int err = 0;
+
+	{
+		// TODO move in a backend class
+		std::stringstream u;
+		u << "http://" << host << ":" << port;
+		base_url = u.str();
+	}
 
 	for (;;) {
 		/*
@@ -752,8 +781,7 @@ VCoproc::MainLoop()
 				std::stringstream data;
 				data << "{\"src_path\": \"" << src_path
 				     << "\"}";
-				if (pproc->PreparePost(
-					"http://localhost:5000/process",
+				if (pproc->PreparePost(base_url + "/process",
 					data.str())) {
 					continue;
 				}
@@ -794,6 +822,8 @@ main(int argc, char **argv)
 	std::vector<std::string> input_dirs;
 	std::string output_dir;
 	std::string dbfile;
+	std::string host;
+	unsigned short port = 0;
 	struct sigaction sa;
 	int verbose  = 0;
 	bool consume = false;
@@ -834,7 +864,7 @@ main(int argc, char **argv)
 		return ret;
 	}
 
-	while ((opt = getopt(argc, argv, "hVvi:o:cmD:")) != -1) {
+	while ((opt = getopt(argc, argv, "hVvi:o:cmD:H:p:")) != -1) {
 		switch (opt) {
 		case 'h':
 			Usage(argv[0]);
@@ -880,16 +910,27 @@ main(int argc, char **argv)
 			monitor = true;
 			break;
 
-		case 'D': {
+		case 'D':
 			dbfile = std::string(optarg);
 			break;
-		}
+
+		case 'H':
+			host = optarg;
+			break;
+
+		case 'p':
+			if (!Str2Num<unsigned short>(optarg, port)) {
+				std::cerr << logb(LogErr) << "Invalid port "
+					  << optarg << std::endl;
+				return -1;
+			}
+			break;
 		}
 	}
 
-	auto vcoproc = VCoproc::Create(stopfd_global, verbose, consume, monitor,
-				       std::move(input_dirs),
-				       std::move(output_dir), dbfile);
+	auto vcoproc = VCoproc::Create(
+	    stopfd_global, verbose, consume, monitor, std::move(input_dirs),
+	    std::move(output_dir), dbfile, host, port);
 	if (vcoproc == nullptr) {
 		return -1;
 	}
