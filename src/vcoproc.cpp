@@ -851,7 +851,7 @@ VCoproc::MainLoop()
 	int err = 0;
 
 	{
-		// TODO move in a backend class
+		// TODO move to a backend class
 		std::stringstream u;
 		u << "http://" << host << ":" << port;
 		base_url = u.str();
@@ -906,12 +906,25 @@ VCoproc::MainLoop()
 			break;
 		}
 
-		/* Wait for any activity on POST transfers. */
-		// TODO add the stop file descriptor
-		cm = curl_multi_wait(curlm, NULL, 0, 1000, &numfds);
+		/*
+		 * Wait for any activity on POST transfers or on the stop
+		 * file descriptor.
+		 */
+		struct curl_waitfd wfd[1];
+		wfd[0].fd = stopfd;
+		wfd[0].events = CURL_WAIT_POLLIN;
+		wfd[0].revents = 0;
+		cm = curl_multi_wait(curlm, wfd, 1, 1000, &numfds);
 		if (cm != CURLM_OK) {
 			std::cerr << "Failed to wait multi handle: "
 				  << curl_multi_strerror(cm) << std::endl;
+			break;
+		}
+
+		if (wfd[0].revents & CURL_WAIT_POLLIN) {
+			if (verbose) {
+				std::cout << "Stopping the event loop" << std::endl;
+			}
 			break;
 		}
 
@@ -927,6 +940,7 @@ VCoproc::MainLoop()
 			if (msg->msg != CURLMSG_DONE) {
 				std::cout << logb(LogInf) << "Got CURLM msg "
 					  << msg->msg << std::endl;
+				continue;
 			}
 
 			cc = curl_easy_getinfo(msg->easy_handle,
