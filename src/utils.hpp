@@ -24,6 +24,7 @@ bool DirExists(const char *path);
 bool DirExists(const std::string &s);
 bool DirEmpty(const std::string &dirpath);
 bool IsDir(const char *path);
+bool IsDir(const std::string &path);
 std::string CurrentDirectory();
 bool IsFile(const char *path);
 bool IsFile(const std::string &path);
@@ -37,6 +38,8 @@ int MkdirIfNotExists(const std::string &path);
 std::string JoinStrings(const std::vector<std::string> &strings,
 			const std::string &delim);
 int CopyFile(const std::string &dstname, const std::string &srcname);
+int MoveToDir(const std::string &dir, const std::string &src);
+int RemoveFile(const std::string &path);
 
 int ExecuteCommand(std::stringstream &cmdss, bool verbose = false,
 		   bool daemonize = false);

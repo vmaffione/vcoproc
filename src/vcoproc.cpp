@@ -41,6 +41,7 @@ Usage(const char *progname)
 	    << "    -c (consume input files)" << std::endl
 	    << "    -m (monitor input directories rather than stop when "
 	       "running out of files)"
+	    << std::endl
 	    << "    -H BACKEND_HOST (address or name of the backend engine)"
 	    << std::endl
 	    << "    -p BACKEND_PORT (TCP port of the backend engine)"
@@ -484,6 +485,9 @@ PendingProc::CompletePost(json11::Json &jsresp)
 	std::string errs;
 
 	if (curl_status != CurlStatus::Prepared) {
+		std::cerr << logb(LogErr)
+			  << "Cannot compete POST: Invalid state "
+			  << static_cast<int>(curl_status) << std::endl;
 		return -1;
 	}
 
@@ -509,6 +513,7 @@ class VCoproc {
 	bool verbose = false;
 	bool consume = false;
 	bool monitor = false;
+	bool forward = false;
 	std::vector<std::string> input_dirs;
 	std::string output_dir;
 	std::string dbfile;
@@ -832,10 +837,11 @@ VCoproc::CleanupCompleted()
 		auto &proc = it->second;
 
 		if (proc->Status() == ProcStatus::Complete) {
-			std::cout << logb(LogDbg) << "Completed "
-				  << proc->FilePath() << std::endl;
-			++it;
-			// it = pending.erase(it);
+			if (verbose) {
+				std::cout << logb(LogDbg) << "Completed "
+					  << proc->FilePath() << std::endl;
+			}
+			it = pending.erase(it);
 		} else {
 			++it;
 		}
@@ -847,6 +853,8 @@ VCoproc::CleanupCompleted()
 int
 VCoproc::MainLoop()
 {
+	int num_running_curls = 0;
+	bool bail_out	      = false;
 	std::string base_url;
 	int err = 0;
 
@@ -857,8 +865,7 @@ VCoproc::MainLoop()
 		base_url = u.str();
 	}
 
-	int num_running_curls = 0, numfds = 0;
-	for (;;) {
+	while (!bail_out) {
 		/*
 		 * First, remove any completed entries from the
 		 * pending table, to make space for new input
@@ -911,10 +918,10 @@ VCoproc::MainLoop()
 		 * file descriptor.
 		 */
 		struct curl_waitfd wfd[1];
-		wfd[0].fd = stopfd;
-		wfd[0].events = CURL_WAIT_POLLIN;
+		wfd[0].fd      = stopfd;
+		wfd[0].events  = CURL_WAIT_POLLIN;
 		wfd[0].revents = 0;
-		cm = curl_multi_wait(curlm, wfd, 1, 1000, &numfds);
+		cm = curl_multi_wait(curlm, wfd, 1, 1000, /*&numfds=*/NULL);
 		if (cm != CURLM_OK) {
 			std::cerr << "Failed to wait multi handle: "
 				  << curl_multi_strerror(cm) << std::endl;
@@ -923,7 +930,8 @@ VCoproc::MainLoop()
 
 		if (wfd[0].revents & CURL_WAIT_POLLIN) {
 			if (verbose) {
-				std::cout << "Stopping the event loop" << std::endl;
+				std::cout << "Stopping the event loop"
+					  << std::endl;
 			}
 			break;
 		}
@@ -938,7 +946,7 @@ VCoproc::MainLoop()
 			CURLcode cc;
 
 			if (msg->msg != CURLMSG_DONE) {
-				std::cout << logb(LogInf) << "Got CURLM msg "
+				std::cerr << logb(LogErr) << "Got CURLM msg "
 					  << msg->msg << std::endl;
 				continue;
 			}
@@ -969,9 +977,12 @@ VCoproc::MainLoop()
 				success = false;
 			}
 
-			std::cout << logb(LogDbg) << "Completed "
-				  << p->FilePath() << " --> " << http_code
-				  << " " << jsresp.dump() << std::endl;
+			if (verbose) {
+				std::cout << logb(LogDbg) << "Completed "
+					  << p->FilePath() << " --> "
+					  << http_code << " " << jsresp.dump()
+					  << std::endl;
+			}
 
 			if (!jsresp.has_key("status")) {
 				std::cerr << logb(LogErr)
@@ -986,6 +997,38 @@ VCoproc::MainLoop()
 			} else {
 				p->SetStatus(ProcStatus::Success);
 			}
+		}
+
+		/* Post process any entries in Success or Failure state. */
+		for (auto &kv : pending) {
+			auto &proc = kv.second;
+
+			if (proc->Status() == ProcStatus::Failure) {
+				/* Handle failure. */
+				if (MoveToDir(output_dir, proc->FilePath())) {
+					bail_out = true;
+				}
+				proc->SetStatus(ProcStatus::Complete);
+				continue;
+			}
+
+			if (proc->Status() != ProcStatus::Success) {
+				continue;
+			}
+
+			/* Handle success. */
+			if (!forward && consume) {
+				if (RemoveFile(proc->FilePath())) {
+					bail_out = true;
+				} else if (verbose) {
+					std::cout << "Removed "
+						  << proc->FilePath()
+						  << std::endl;
+				}
+			} else {
+			}
+
+			proc->SetStatus(ProcStatus::Complete);
 		}
 
 		if (num_running_curls == 0) {

@@ -75,6 +75,12 @@ IsDir(const char *path)
 	return DirExists(path);
 }
 
+bool
+IsDir(const std::string &s)
+{
+	return DirExists(s);
+}
+
 std::string
 CurrentDirectory()
 {
@@ -305,6 +311,41 @@ CopyFile(const std::string &dstname, const std::string &srcname)
 				  << std::flush;
 			return n;
 		}
+	}
+
+	return 0;
+}
+
+int
+MoveToDir(const std::string &dir, const std::string &src)
+{
+	std::string path;
+
+	if (!IsDir(dir)) {
+		std::cerr << "Cannot move " << src << ": " << dir
+			  << " is not a directory" << std::endl;
+		return -1;
+	}
+
+	path = FileBaseName(src);
+	path = PathJoin(dir, path);
+
+	if (rename(src.c_str(), path.c_str())) {
+		std::cerr << "Failed to rename " << src << " --> " << path
+			  << std::endl;
+		return -1;
+	}
+
+	return 0;
+}
+
+int
+RemoveFile(const std::string &path)
+{
+	if (unlink(path.c_str())) {
+		std::cerr << "Failed to remove " << path << ": "
+			  << strerror(errno) << std::endl;
+		return -1;
 	}
 
 	return 0;
