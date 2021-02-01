@@ -987,30 +987,24 @@ VCoproc::MainLoop()
 		 * Post process any entries in ProcSuccess or ProcFailure state.
 		 */
 		for (auto &kv : pending) {
+			bool remove, copy, move, copymove, success, failure;
 			auto &proc = kv.second;
+			std::string dstdir;
 
-			if (proc->Status() == ProcStatus::ProcFailure) {
-				/* Handle failure. */
-				if (MoveToDir(failed_dir, proc->FilePath())) {
-					bail_out = true;
-				} else if (verbose) {
-					std::cout << logb(LogDbg) << "Moved "
-						  << proc->FilePath() << " --> "
-						  << failed_dir << std::endl;
-				}
-				proc->SetStatus(ProcStatus::Complete);
+			success = proc->Status() == ProcStatus::ProcSuccess;
+			failure = proc->Status() == ProcStatus::ProcFailure;
+
+			if (!(success || failure)) {
 				continue;
 			}
 
-			if (proc->Status() != ProcStatus::ProcSuccess) {
-				continue;
-			}
+			remove	 = success && consume && !forward;
+			copymove = failure || (success && forward);
+			copy	 = copymove && !consume;
+			move	 = copymove && consume;
+			dstdir	 = failure ? failed_dir : forward_dir;
 
-			/*
-			 * Handle success. Either remove the file or forward it
-			 * for further processing.
-			 */
-			if (consume && !forward) {
+			if (remove) {
 				if (RemoveFile(proc->FilePath())) {
 					bail_out = true;
 				} else if (verbose) {
@@ -1018,22 +1012,26 @@ VCoproc::MainLoop()
 						  << proc->FilePath()
 						  << std::endl;
 				}
-			} else if (consume && forward) {
-				if (MoveToDir(forward_dir, proc->FilePath())) {
+
+			} else if (move) {
+				if (MoveToDir(dstdir, proc->FilePath())) {
 					bail_out = true;
 				} else if (verbose) {
 					std::cout << logb(LogDbg) << "Moved "
 						  << proc->FilePath() << " --> "
-						  << forward_dir << std::endl;
+						  << dstdir << std::endl;
 				}
-			} else if (!consume && forward) {
-				if (CopyToDir(forward_dir, proc->FilePath())) {
+
+			} else if (copy) {
+				if (CopyToDir(dstdir, proc->FilePath())) {
 					bail_out = true;
 				} else if (verbose) {
 					std::cout << logb(LogDbg) << "Copied "
 						  << proc->FilePath() << " --> "
-						  << forward_dir << std::endl;
+						  << dstdir << std::endl;
 				}
+			} else {
+				/* success && !consume && !forward */
 			}
 
 			proc->SetStatus(ProcStatus::Complete);
