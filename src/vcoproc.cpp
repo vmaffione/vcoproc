@@ -549,7 +549,6 @@ class VCoproc {
 	/* Map of in-progress proc entries. */
 	std::unordered_map<std::string, std::unique_ptr<PendingProc>> pending;
 
-	int StoppableSleep(int milliseconds);
 	int FetchMoreFiles();
 	int FetchFilesFromDir(const std::string &dir,
 			      std::deque<std::string> &frontier, int &credits);
@@ -611,6 +610,11 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 	if (port == 0) {
 		std::cerr << logb(LogErr) << "No port specified" << std::endl;
 		return nullptr;
+	}
+
+	if (monitor) {
+		/* We must consume in monitor mode. */
+		consume = true;
 	}
 
 	CURLM *curlm = curl_multi_init();
@@ -678,50 +682,6 @@ VCoproc::~VCoproc()
 	if (curlm != nullptr) {
 		curl_multi_cleanup(curlm);
 	}
-}
-
-/*
- * Sleep for a given number of milliseconds. On error, -1 is returned.
- * If the loop was stopped during the sleep, it returns 1.
- * If the sleep was not interrupted, it returns 0.
- */
-int
-VCoproc::StoppableSleep(int milliseconds)
-{
-	struct pollfd pfd[1];
-
-	pfd[0].fd     = stopfd;
-	pfd[0].events = POLLIN;
-
-	for (;;) {
-		int ret = poll(pfd, 1, /*timeout_ms=*/milliseconds);
-
-		if (ret < 0) {
-			if (errno == EINTR) {
-				/*
-				 * This happens if a signal was caught
-				 * during poll. We just continue, so that
-				 * the signal handler can write to the
-				 * stopfd and poll() returns 1.
-				 */
-				continue;
-			}
-			std::cerr << logb(LogErr)
-				  << "poll() failed: " << strerror(errno)
-				  << std::endl;
-			return ret;
-		}
-
-		if (ret > 0) {
-			assert(pfd[0].revents & POLLIN);
-			EventFdDrain(stopfd);
-
-			return 1;
-		}
-		break;
-	}
-
-	return 0;
 }
 
 int
@@ -903,6 +863,7 @@ VCoproc::MainLoop()
 	 */
 	bool bail_out	      = false;
 	int num_running_curls = 0;
+	int timeout_ms	      = 5000;
 	std::string base_url;
 	int err = 0;
 
@@ -914,16 +875,6 @@ VCoproc::MainLoop()
 	}
 
 	while (!bail_out) {
-		/*
-		 * First, remove any completed entries from the
-		 * pending table, to make space for new input
-		 * files.
-		 */
-		err = CleanupCompleted();
-		if (err) {
-			break;
-		}
-
 		/*
 		 * Refill the pending table by fetching more files from the
 		 * input directories.
@@ -1037,6 +988,10 @@ VCoproc::MainLoop()
 				/* Handle failure. */
 				if (MoveToDir(failed_dir, proc->FilePath())) {
 					bail_out = true;
+				} else if (verbose) {
+					std::cout << logb(LogDbg) << "Moved "
+						  << proc->FilePath() << " --> "
+						  << failed_dir << std::endl;
 				}
 				proc->SetStatus(ProcStatus::Complete);
 				continue;
@@ -1080,6 +1035,16 @@ VCoproc::MainLoop()
 		}
 
 		/*
+		 * Remove any completed entries from the
+		 * pending table, to make space for new input
+		 * files.
+		 */
+		err = CleanupCompleted();
+		if (err) {
+			break;
+		}
+
+		/*
 		 * When there are no more files to be processed or pending
 		 * activities, stop if we are not in monitor mode.
 		 */
@@ -1095,7 +1060,8 @@ VCoproc::MainLoop()
 		wfd[0].fd      = stopfd;
 		wfd[0].events  = CURL_WAIT_POLLIN;
 		wfd[0].revents = 0;
-		cm = curl_multi_wait(curlm, wfd, 1, 1000, /*&numfds=*/NULL);
+		cm = curl_multi_wait(curlm, wfd, 1, timeout_ms,
+				     /*&numfds=*/NULL);
 		if (cm != CURLM_OK) {
 			std::cerr << "Failed to wait multi handle: "
 				  << curl_multi_strerror(cm) << std::endl;
@@ -1103,6 +1069,7 @@ VCoproc::MainLoop()
 		}
 
 		if (wfd[0].revents & CURL_WAIT_POLLIN) {
+			EventFdDrain(stopfd);
 			if (verbose) {
 				std::cout << "Stopping the event loop"
 					  << std::endl;
