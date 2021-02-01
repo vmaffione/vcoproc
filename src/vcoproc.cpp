@@ -34,8 +34,12 @@ Usage(const char *progname)
 	    << "    -V (print version info and exit)" << std::endl
 	    << "    -v (increase verbosity level)" << std::endl
 	    << "    -i INPUT_DIR (add directory to look for files)" << std::endl
-	    << "    -o OUTPUT_DIR (directory to store "
-	       "incoming files)"
+	    << "    -o OUTPUT_DIR (directory where to store "
+	       "JSON processing output)"
+	    << std::endl
+	    << "    -F FAILED_DIR (directory where to store failed files)"
+	    << std::endl
+	    << "    -f FORWARD_DIR (directory where to move processed files)"
 	    << std::endl
 	    << "    -D DB_FILE (path to the sqlite3 database file)" << std::endl
 	    << "    -c (consume input files)" << std::endl
@@ -45,8 +49,6 @@ Usage(const char *progname)
 	    << "    -H BACKEND_HOST (address or name of the backend engine)"
 	    << std::endl
 	    << "    -p BACKEND_PORT (TCP port of the backend engine)"
-	    << std::endl
-	    << std::endl
 	    << std::endl;
 }
 
@@ -276,12 +278,12 @@ SQLiteDbConn::SelectStmt(const std::stringstream &ss, bool verbose)
 }
 
 enum class ProcStatus {
-	None	 = 0,
-	New	 = 1,
-	Waiting	 = 2,
-	Success	 = 3,
-	Failure	 = 4,
-	Complete = 5,
+	None	    = 0,
+	New	    = 1,
+	Waiting	    = 2,
+	ProcSuccess = 3,
+	ProcFailure = 4,
+	Complete    = 5,
 };
 
 /*
@@ -298,6 +300,7 @@ class PendingProc {
 	CURLM *curlm = nullptr;
 	CURL *curl   = nullptr;
 	std::string src_path;
+	bool verbose = false;
 	std::string postdata;
 
 	CurlStatus curl_status = CurlStatus::Idle;
@@ -305,18 +308,20 @@ class PendingProc {
 	std::stringstream postresp;
 
     public:
-	PendingProc(CURLM *curlm, CURL *curl, const std::string &src_path)
-	    : curlm(curlm), curl(curl), src_path(src_path)
+	PendingProc(CURLM *curlm, CURL *curl, const std::string &src_path,
+		    bool verbose)
+	    : curlm(curlm), curl(curl), src_path(src_path), verbose(verbose)
 	{
 	}
 
 	~PendingProc();
 
 	ProcStatus Status() const { return proc_status; }
-	void SetStatus(ProcStatus status) { proc_status = status; }
+	void SetStatus(ProcStatus status);
 	std::string FilePath() const { return src_path; }
 	static std::unique_ptr<PendingProc> Create(CURLM *curlm,
-						   const std::string &src_path);
+						   const std::string &src_path,
+						   bool verbose);
 	static size_t CurlWriteCallback(void *data, size_t size, size_t nmemb,
 					void *userp);
 	void AppendResponse(void *data, size_t size);
@@ -325,7 +330,7 @@ class PendingProc {
 };
 
 std::unique_ptr<PendingProc>
-PendingProc::Create(CURLM *curlm, const std::string &src_path)
+PendingProc::Create(CURLM *curlm, const std::string &src_path, bool verbose)
 {
 	CURLcode cc;
 	CURL *curl;
@@ -358,7 +363,8 @@ PendingProc::Create(CURLM *curlm, const std::string &src_path)
 		return nullptr;
 	}
 
-	auto proc = std::make_unique<PendingProc>(curlm, curl, src_path);
+	auto proc =
+	    std::make_unique<PendingProc>(curlm, curl, src_path, verbose);
 
 	/* Link the new PendingProc instance to the curl handle. */
 	cc = curl_easy_setopt(curl, CURLOPT_PRIVATE, (void *)proc.get());
@@ -406,6 +412,17 @@ PendingProc::CurlWriteCallback(void *data, size_t size, size_t nmemb,
 	proc->AppendResponse(data, chunksz);
 
 	return chunksz;
+}
+
+void
+PendingProc::SetStatus(ProcStatus status)
+{
+	if (verbose) {
+		std::cout << logb(LogDbg) << src_path << ": "
+			  << static_cast<int>(proc_status) << " -> "
+			  << static_cast<int>(status) << std::endl;
+	}
+	proc_status = status;
 }
 
 void
@@ -513,9 +530,10 @@ class VCoproc {
 	bool verbose = false;
 	bool consume = false;
 	bool monitor = false;
-	bool forward = false;
 	std::vector<std::string> input_dirs;
 	std::string output_dir;
+	std::string failed_dir;
+	std::string forward_dir;
 	std::string dbfile;
 	std::unique_ptr<SQLiteDbConn> dbconn;
 	std::string host;
@@ -541,11 +559,13 @@ class VCoproc {
 	static std::unique_ptr<VCoproc> Create(
 	    int stopfd, bool verbose, bool consume, bool monitor,
 	    std::vector<std::string> input_dirs, std::string output_dir,
-	    std::string dbfile, std::string host, unsigned short port);
+	    std::string failed_dir, std::string forward_dir, std::string dbfile,
+	    std::string host, unsigned short port);
 
 	VCoproc(int stopfd, CURLM *curlm, bool verbose, bool consume,
 		bool monitor, std::vector<std::string> input_dirs,
-		std::string output_dir, std::string dbfile,
+		std::string output_dir, std::string failed_dir,
+		std::string forward_dir, std::string dbfile,
 		std::unique_ptr<SQLiteDbConn> dbconn, std::string host,
 		unsigned short port);
 	~VCoproc();
@@ -555,6 +575,7 @@ class VCoproc {
 std::unique_ptr<VCoproc>
 VCoproc::Create(int stopfd, bool verbose, bool consume, bool monitor,
 		std::vector<std::string> input_dirs, std::string output_dir,
+		std::string failed_dir, std::string forward_dir,
 		std::string dbfile, std::string host, unsigned short port)
 {
 	if (input_dirs.empty()) {
@@ -565,6 +586,12 @@ VCoproc::Create(int stopfd, bool verbose, bool consume, bool monitor,
 
 	if (output_dir.empty()) {
 		std::cerr << logb(LogErr) << "No output directory specified"
+			  << std::endl;
+		return nullptr;
+	}
+
+	if (failed_dir.empty()) {
+		std::cerr << logb(LogErr) << "No failed directory specified"
 			  << std::endl;
 		return nullptr;
 	}
@@ -613,13 +640,15 @@ VCoproc::Create(int stopfd, bool verbose, bool consume, bool monitor,
 
 	return std::make_unique<VCoproc>(
 	    stopfd, curlm, verbose, consume, monitor, std::move(input_dirs),
-	    std::move(output_dir), std::move(dbfile), std::move(dbconn),
+	    std::move(output_dir), std::move(failed_dir),
+	    std::move(forward_dir), std::move(dbfile), std::move(dbconn),
 	    std::move(host), port);
 }
 
 VCoproc::VCoproc(int stopfd, CURLM *curlm, bool verbose, bool consume,
 		 bool monitor, std::vector<std::string> input_dirs,
-		 std::string output_dir, std::string dbfile,
+		 std::string output_dir, std::string failed_dir,
+		 std::string forward_dir, std::string dbfile,
 		 std::unique_ptr<SQLiteDbConn> dbconn, std::string host,
 		 unsigned short port)
     : stopfd(stopfd),
@@ -629,6 +658,8 @@ VCoproc::VCoproc(int stopfd, CURLM *curlm, bool verbose, bool consume,
       monitor(monitor),
       input_dirs(std::move(input_dirs)),
       output_dir(std::move(output_dir)),
+      failed_dir(std::move(failed_dir)),
+      forward_dir(std::move(forward_dir)),
       dbfile(std::move(dbfile)),
       dbconn(std::move(dbconn)),
       host(std::move(host)),
@@ -813,8 +844,8 @@ VCoproc::FetchFilesFromDir(const std::string &dirname,
 		std::stringstream qss;
 
 		if (!pending.count(path)) {
-			pending[path] =
-			    std::move(PendingProc::Create(curlm, path));
+			pending[path] = std::move(
+			    PendingProc::Create(curlm, path, verbose));
 			if (verbose) {
 				std::cout << logb(LogDbg) << "New file " << path
 					  << std::endl;
@@ -853,8 +884,13 @@ VCoproc::CleanupCompleted()
 int
 VCoproc::MainLoop()
 {
-	int num_running_curls = 0;
+	bool forward = !forward_dir.empty();
+	/*
+	 * The loop below will set bail_out to true when we get and error
+	 * from which we cannot recover.
+	 */
 	bool bail_out	      = false;
+	int num_running_curls = 0;
 	std::string base_url;
 	int err = 0;
 
@@ -978,7 +1014,7 @@ VCoproc::MainLoop()
 			}
 
 			if (verbose) {
-				std::cout << logb(LogDbg) << "Completed "
+				std::cout << logb(LogDbg) << "Processed "
 					  << p->FilePath() << " --> "
 					  << http_code << " " << jsresp.dump()
 					  << std::endl;
@@ -993,45 +1029,65 @@ VCoproc::MainLoop()
 			}
 
 			if (!success) {
-				p->SetStatus(ProcStatus::Failure);
+				p->SetStatus(ProcStatus::ProcFailure);
 			} else {
-				p->SetStatus(ProcStatus::Success);
+				p->SetStatus(ProcStatus::ProcSuccess);
 			}
 		}
 
-		/* Post process any entries in Success or Failure state. */
+		/* Post process any entries in ProcSuccess or ProcFailure state.
+		 */
 		for (auto &kv : pending) {
 			auto &proc = kv.second;
 
-			if (proc->Status() == ProcStatus::Failure) {
+			if (proc->Status() == ProcStatus::ProcFailure) {
 				/* Handle failure. */
-				if (MoveToDir(output_dir, proc->FilePath())) {
+				if (MoveToDir(failed_dir, proc->FilePath())) {
 					bail_out = true;
 				}
 				proc->SetStatus(ProcStatus::Complete);
 				continue;
 			}
 
-			if (proc->Status() != ProcStatus::Success) {
+			if (proc->Status() != ProcStatus::ProcSuccess) {
 				continue;
 			}
 
-			/* Handle success. */
-			if (!forward && consume) {
+			/*
+			 * Handle success. Either remove the file or forward it
+			 * for further processing.
+			 */
+			if (consume && !forward) {
 				if (RemoveFile(proc->FilePath())) {
 					bail_out = true;
 				} else if (verbose) {
-					std::cout << "Removed "
+					std::cout << logb(LogDbg) << "Removed "
 						  << proc->FilePath()
 						  << std::endl;
 				}
-			} else {
+			} else if (consume && forward) {
+				if (MoveToDir(forward_dir, proc->FilePath())) {
+					bail_out = true;
+				} else if (verbose) {
+					std::cout << logb(LogDbg) << "Moved "
+						  << proc->FilePath() << " --> "
+						  << forward_dir << std::endl;
+				}
+			} else if (!consume && forward) {
+				if (CopyToDir(forward_dir, proc->FilePath())) {
+					bail_out = true;
+				} else if (verbose) {
+					std::cout << logb(LogDbg) << "Copied "
+						  << proc->FilePath() << " --> "
+						  << forward_dir << std::endl;
+				}
 			}
 
 			proc->SetStatus(ProcStatus::Complete);
 		}
 
 		if (num_running_curls == 0) {
+			// TODO check that there are no more files
 			/*
 			 * No more files to be processed or pending
 			 * activities. In monitor mode, sleep for a
@@ -1064,6 +1120,8 @@ main(int argc, char **argv)
 {
 	std::vector<std::string> input_dirs;
 	std::string output_dir;
+	std::string failed_dir;
+	std::string forward_dir;
 	std::string dbfile;
 	std::string host;
 	unsigned short port = 0;
@@ -1107,7 +1165,7 @@ main(int argc, char **argv)
 		return ret;
 	}
 
-	while ((opt = getopt(argc, argv, "hVvi:o:cmD:H:p:")) != -1) {
+	while ((opt = getopt(argc, argv, "hVvi:o:F:f:cmD:H:p:")) != -1) {
 		switch (opt) {
 		case 'h':
 			Usage(argv[0]);
@@ -1145,6 +1203,28 @@ main(int argc, char **argv)
 			break;
 		}
 
+		case 'F': {
+			if (!DirExists(optarg)) {
+				std::cerr << logb(LogErr) << "Directory "
+					  << optarg << " not found "
+					  << std::endl;
+				return -1;
+			}
+			failed_dir = std::string(optarg);
+			break;
+		}
+
+		case 'f': {
+			if (!DirExists(optarg)) {
+				std::cerr << logb(LogErr) << "Directory "
+					  << optarg << " not found "
+					  << std::endl;
+				return -1;
+			}
+			forward_dir = std::string(optarg);
+			break;
+		}
+
 		case 'c':
 			consume = true;
 			break;
@@ -1175,7 +1255,8 @@ main(int argc, char **argv)
 
 	auto vcoproc = VCoproc::Create(
 	    stopfd_global, verbose, consume, monitor, std::move(input_dirs),
-	    std::move(output_dir), dbfile, host, port);
+	    std::move(output_dir), std::move(failed_dir),
+	    std::move(forward_dir), dbfile, host, port);
 	if (vcoproc == nullptr) {
 		return -1;
 	}

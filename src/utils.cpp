@@ -319,7 +319,7 @@ CopyFile(const std::string &dstname, const std::string &srcname)
 int
 MoveToDir(const std::string &dir, const std::string &src)
 {
-	std::string path;
+	std::string dstpath;
 
 	if (!IsDir(dir)) {
 		std::cerr << "Cannot move " << src << ": " << dir
@@ -327,11 +327,11 @@ MoveToDir(const std::string &dir, const std::string &src)
 		return -1;
 	}
 
-	path = FileBaseName(src);
-	path = PathJoin(dir, path);
+	dstpath = FileBaseName(src);
+	dstpath = PathJoin(dir, dstpath);
 
-	if (rename(src.c_str(), path.c_str())) {
-		std::cerr << "Failed to rename " << src << " --> " << path
+	if (rename(src.c_str(), dstpath.c_str())) {
+		std::cerr << "Failed to rename " << src << " --> " << dstpath
 			  << std::endl;
 		return -1;
 	}
@@ -340,8 +340,37 @@ MoveToDir(const std::string &dir, const std::string &src)
 }
 
 int
+CopyToDir(const std::string &dir, const std::string &srcname)
+{
+	std::string dstpath;
+
+	if (!IsDir(dir)) {
+		std::cerr << "Cannot move " << srcname << ": " << dir
+			  << " is not a directory" << std::endl;
+		return -1;
+	}
+
+	if (!IsFile(srcname)) {
+		std::cerr << "Cannot move " << srcname << ": not a file"
+			  << std::endl;
+		return -1;
+	}
+
+	dstpath = FileBaseName(srcname);
+	dstpath = PathJoin(dir, dstpath);
+
+	return CopyFile(dstpath, srcname);
+}
+
+int
 RemoveFile(const std::string &path)
 {
+	if (!IsFile(path)) {
+		std::cerr << "Cannot remove " << path << ": not a file"
+			  << std::endl;
+		return -1;
+	}
+
 	if (unlink(path.c_str())) {
 		std::cerr << "Failed to remove " << path << ": "
 			  << strerror(errno) << std::endl;

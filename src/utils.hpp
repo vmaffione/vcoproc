@@ -38,6 +38,7 @@ int MkdirIfNotExists(const std::string &path);
 std::string JoinStrings(const std::vector<std::string> &strings,
 			const std::string &delim);
 int CopyFile(const std::string &dstname, const std::string &srcname);
+int CopyToDir(const std::string &dir, const std::string &srcname);
 int MoveToDir(const std::string &dir, const std::string &src);
 int RemoveFile(const std::string &path);
 
