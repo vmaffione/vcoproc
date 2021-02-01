@@ -182,6 +182,18 @@ FileHasExtension(const std::string &filename, const std::string &ext)
 	       filename.substr(filename.size() - ext.size()) == ext;
 }
 
+std::string
+PathNameNoExt(const std::string &path)
+{
+	size_t slashpos = path.rfind('.');
+
+	if (slashpos == std::string::npos) {
+		return path;
+	}
+
+	return path.substr(0, slashpos);
+}
+
 static std::string
 CurtimeString()
 {

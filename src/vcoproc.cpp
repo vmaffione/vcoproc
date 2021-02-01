@@ -4,6 +4,7 @@
 #include <curl/curl.h>
 #include <deque>
 #include <dirent.h>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <poll.h>
@@ -973,7 +974,21 @@ VCoproc::MainLoop()
 					  << "Missing status key" << std::endl;
 				success = false;
 			} else {
-				success = jsresp["status"] == "COMPLETE";
+				success = (jsresp["status"] == "COMPLETE") ||
+					  (jsresp["status"] == "NOMETADATA");
+			}
+
+			if (success) {
+				/* Output JSON. */
+				std::string jsname =
+				    FileBaseName(p->FilePath());
+				std::string jspath;
+
+				jsname = PathNameNoExt(jsname) + ".json";
+				jspath = PathJoin(output_dir, jsname);
+				std::ofstream fout(jspath);
+				fout << jsresp.dump();
+				fout << std::endl;
 			}
 
 			if (!success) {

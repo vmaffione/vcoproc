@@ -105,10 +105,14 @@ class TestRequestHandler(myhttp.RequestHandler):
                         return self.return_error(404)
 
         def do_POST_process(self, path, jsreq):
+                time.sleep(random.uniform(0.01, 1.1))
                 if random.uniform(0.0, 1.0) < 0.2:
                     jsresp = {'status': 'ERROR', 'reason': 'You unlucky'}
                 else:
-                    jsresp = {'status': 'COMPLETE'}
+                    if random.uniform(0.0, 1.0) < 0.8:
+                        jsresp = {'status': 'COMPLETE'}
+                    else:
+                        jsresp = {'status': 'NOMETADATA'}
                 return self.return_json(jsresp)
 
 
