@@ -162,6 +162,19 @@ FileParentDir(const std::string &path)
 	return path.substr(0, slashpos);
 }
 
+std::string
+AbsPath(const std::string &path)
+{
+	char result[PATH_MAX + 1];
+
+	if (realpath(path.c_str(), result) == nullptr) {
+		return std::string();
+	}
+	result[PATH_MAX] = '\0';
+
+	return std::string(result);
+}
+
 bool
 FileHasExtension(const std::string &filename, const std::string &ext)
 {

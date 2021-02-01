@@ -808,7 +808,14 @@ VCoproc::FetchFilesFromDir(const std::string &dirname,
 		 * database (if it's not already there) and decrease the
 		 * credits.
 		 */
-		std::stringstream qss;
+		std::string apath = AbsPath(path);
+
+		if (apath.empty()) {
+			std::cerr << logb(LogErr) << "AbsPath(" << path
+				  << ") failed!" << std::endl;
+		} else {
+			path = apath;
+		}
 
 		if (!pending.count(path)) {
 			pending[path] = std::move(
@@ -829,8 +836,6 @@ VCoproc::FetchFilesFromDir(const std::string &dirname,
 int
 VCoproc::CleanupCompleted()
 {
-	std::stringstream qss;
-
 	for (auto it = pending.begin(); it != pending.end();) {
 		auto &proc = it->second;
 
@@ -1060,8 +1065,8 @@ VCoproc::MainLoop()
 		wfd[0].fd      = stopfd;
 		wfd[0].events  = CURL_WAIT_POLLIN;
 		wfd[0].revents = 0;
-		cm = curl_multi_wait(curlm, wfd, 1, timeout_ms,
-				     /*&numfds=*/NULL);
+		cm	       = curl_multi_wait(curlm, wfd, 1, timeout_ms,
+					 /*&numfds=*/NULL);
 		if (cm != CURLM_OK) {
 			std::cerr << "Failed to wait multi handle: "
 				  << curl_multi_strerror(cm) << std::endl;
