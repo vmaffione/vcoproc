@@ -727,7 +727,14 @@ VCoproc::StoppableSleep(int milliseconds)
 int
 VCoproc::FetchMoreFiles()
 {
-	int credits = MaxEntries;
+	/*
+	 * If we are consuming the files, the corresponding entries are
+	 * removed as soon as the post processing is complete, and so
+	 * we can limit the pending table to MaxEntries.
+	 * Otherwise we must use a much larger limit.
+	 * TODO: maybe use DB to store the completed entries...
+	 */
+	int credits = consume ? MaxEntries : 8192;
 
 	assert(input_dir_idx < input_dirs.size());
 
@@ -867,7 +874,12 @@ VCoproc::CleanupCompleted()
 	for (auto it = pending.begin(); it != pending.end();) {
 		auto &proc = it->second;
 
-		if (proc->Status() == ProcStatus::Complete) {
+		/*
+		 * Don't remove the entry from the pending
+		 * table if we are not consuming the files,
+		 * otherwise we would reprocess it.
+		 */
+		if (proc->Status() == ProcStatus::Complete && consume) {
 			if (verbose) {
 				std::cout << logb(LogDbg) << "Completed "
 					  << proc->FilePath() << std::endl;
@@ -925,12 +937,15 @@ VCoproc::MainLoop()
 		 * Scan any new entries and prepare a POST request to
 		 * submit to the backend engine.
 		 */
+		int new_files = 0;
 		for (auto &kv : pending) {
 			auto &proc = kv.second;
 
 			if (proc->Status() != ProcStatus::New) {
 				continue;
 			}
+
+			new_files++;
 
 			json11::Json jsreq = json11::Json::object{
 			    {"file_name", proc->FilePath()},
@@ -946,29 +961,6 @@ VCoproc::MainLoop()
 		if (cm != CURLM_OK) {
 			std::cerr << "Failed to perform multi handle: "
 				  << curl_multi_strerror(cm) << std::endl;
-			break;
-		}
-
-		/*
-		 * Wait for any activity on POST transfers or on the stop
-		 * file descriptor.
-		 */
-		struct curl_waitfd wfd[1];
-		wfd[0].fd      = stopfd;
-		wfd[0].events  = CURL_WAIT_POLLIN;
-		wfd[0].revents = 0;
-		cm = curl_multi_wait(curlm, wfd, 1, 1000, /*&numfds=*/NULL);
-		if (cm != CURLM_OK) {
-			std::cerr << "Failed to wait multi handle: "
-				  << curl_multi_strerror(cm) << std::endl;
-			break;
-		}
-
-		if (wfd[0].revents & CURL_WAIT_POLLIN) {
-			if (verbose) {
-				std::cout << "Stopping the event loop"
-					  << std::endl;
-			}
 			break;
 		}
 
@@ -1035,7 +1027,8 @@ VCoproc::MainLoop()
 			}
 		}
 
-		/* Post process any entries in ProcSuccess or ProcFailure state.
+		/*
+		 * Post process any entries in ProcSuccess or ProcFailure state.
 		 */
 		for (auto &kv : pending) {
 			auto &proc = kv.second;
@@ -1086,28 +1079,34 @@ VCoproc::MainLoop()
 			proc->SetStatus(ProcStatus::Complete);
 		}
 
-		if (num_running_curls == 0) {
-			// TODO check that there are no more files
-			/*
-			 * No more files to be processed or pending
-			 * activities. In monitor mode, sleep for a
-			 * little bit. Otherwise just stop.
-			 */
-			if (!monitor) {
-				break;
-			}
-
-			if (StoppableSleep(3000) > 0) {
-				std::cout << logb(LogInf)
-					  << "Stopping the main loop"
-					  << std::endl
-					  << std::flush;
-				break;
-			}
-			continue;
+		/*
+		 * When there are no more files to be processed or pending
+		 * activities, stop if we are not in monitor mode.
+		 */
+		if (num_running_curls == 0 && new_files == 0 && !monitor) {
+			break;
 		}
 
-		if (num_running_curls == 0) {
+		/*
+		 * Wait for any activity on POST transfers or on the stop
+		 * file descriptor.
+		 */
+		struct curl_waitfd wfd[1];
+		wfd[0].fd      = stopfd;
+		wfd[0].events  = CURL_WAIT_POLLIN;
+		wfd[0].revents = 0;
+		cm = curl_multi_wait(curlm, wfd, 1, 1000, /*&numfds=*/NULL);
+		if (cm != CURLM_OK) {
+			std::cerr << "Failed to wait multi handle: "
+				  << curl_multi_strerror(cm) << std::endl;
+			break;
+		}
+
+		if (wfd[0].revents & CURL_WAIT_POLLIN) {
+			if (verbose) {
+				std::cout << "Stopping the event loop"
+					  << std::endl;
+			}
 			break;
 		}
 	}
