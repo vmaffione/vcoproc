@@ -188,9 +188,9 @@ class SQLiteDbConn {
 	SQLiteDbConn(sqlite3 *dbh) : dbh(dbh) {}
 	~SQLiteDbConn();
 
-	int ModifyStmt(const std::stringstream &ss, bool verbose);
+	int ModifyStmt(const std::stringstream &ss, int verbose);
 	std::unique_ptr<SQLiteDbCursor> SelectStmt(const std::stringstream &ss,
-						   bool verbose);
+						   int verbose);
 };
 
 std::unique_ptr<SQLiteDbConn>
@@ -219,7 +219,7 @@ SQLiteDbConn::~SQLiteDbConn()
 }
 
 int
-SQLiteDbConn::ModifyStmt(const std::stringstream &ss, bool verbose)
+SQLiteDbConn::ModifyStmt(const std::stringstream &ss, int verbose)
 {
 	if (verbose) {
 		std::cout << "Q: " << ss.str() << std::endl;
@@ -256,7 +256,7 @@ SQLiteDbConn::ModifyStmt(const std::stringstream &ss, bool verbose)
 }
 
 std::unique_ptr<SQLiteDbCursor>
-SQLiteDbConn::SelectStmt(const std::stringstream &ss, bool verbose)
+SQLiteDbConn::SelectStmt(const std::stringstream &ss, int verbose)
 {
 	if (verbose) {
 		std::cout << "Q: " << ss.str() << std::endl;
@@ -300,7 +300,7 @@ class PendingProc {
 	CURLM *curlm = nullptr;
 	CURL *curl   = nullptr;
 	std::string src_path;
-	bool verbose = false;
+	int verbose = 0;
 	std::string postdata;
 
 	CurlStatus curl_status = CurlStatus::Idle;
@@ -309,7 +309,7 @@ class PendingProc {
 
     public:
 	PendingProc(CURLM *curlm, CURL *curl, const std::string &src_path,
-		    bool verbose)
+		    int verbose)
 	    : curlm(curlm), curl(curl), src_path(src_path), verbose(verbose)
 	{
 	}
@@ -321,7 +321,7 @@ class PendingProc {
 	std::string FilePath() const { return src_path; }
 	static std::unique_ptr<PendingProc> Create(CURLM *curlm,
 						   const std::string &src_path,
-						   bool verbose);
+						   int verbose);
 	static size_t CurlWriteCallback(void *data, size_t size, size_t nmemb,
 					void *userp);
 	void AppendResponse(void *data, size_t size);
@@ -330,7 +330,7 @@ class PendingProc {
 };
 
 std::unique_ptr<PendingProc>
-PendingProc::Create(CURLM *curlm, const std::string &src_path, bool verbose)
+PendingProc::Create(CURLM *curlm, const std::string &src_path, int verbose)
 {
 	CURLcode cc;
 	CURL *curl;
@@ -417,7 +417,7 @@ PendingProc::CurlWriteCallback(void *data, size_t size, size_t nmemb,
 void
 PendingProc::SetStatus(ProcStatus status)
 {
-	if (verbose) {
+	if (verbose >= 2) {
 		std::cout << logb(LogDbg) << src_path << ": "
 			  << static_cast<int>(proc_status) << " -> "
 			  << static_cast<int>(status) << std::endl;
@@ -527,7 +527,7 @@ PendingProc::CompletePost(json11::Json &jsresp)
 class VCoproc {
 	int stopfd   = -1; /* owned by the caller, not by us */
 	CURLM *curlm = nullptr;
-	bool verbose = false;
+	int verbose  = 0;
 	bool consume = false;
 	bool monitor = false;
 	std::vector<std::string> input_dirs;
@@ -557,12 +557,12 @@ class VCoproc {
 
     public:
 	static std::unique_ptr<VCoproc> Create(
-	    int stopfd, bool verbose, bool consume, bool monitor,
+	    int stopfd, int verbose, bool consume, bool monitor,
 	    std::vector<std::string> input_dirs, std::string output_dir,
 	    std::string failed_dir, std::string forward_dir, std::string dbfile,
 	    std::string host, unsigned short port);
 
-	VCoproc(int stopfd, CURLM *curlm, bool verbose, bool consume,
+	VCoproc(int stopfd, CURLM *curlm, int verbose, bool consume,
 		bool monitor, std::vector<std::string> input_dirs,
 		std::string output_dir, std::string failed_dir,
 		std::string forward_dir, std::string dbfile,
@@ -573,7 +573,7 @@ class VCoproc {
 };
 
 std::unique_ptr<VCoproc>
-VCoproc::Create(int stopfd, bool verbose, bool consume, bool monitor,
+VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		std::vector<std::string> input_dirs, std::string output_dir,
 		std::string failed_dir, std::string forward_dir,
 		std::string dbfile, std::string host, unsigned short port)
@@ -645,7 +645,7 @@ VCoproc::Create(int stopfd, bool verbose, bool consume, bool monitor,
 	    std::move(host), port);
 }
 
-VCoproc::VCoproc(int stopfd, CURLM *curlm, bool verbose, bool consume,
+VCoproc::VCoproc(int stopfd, CURLM *curlm, int verbose, bool consume,
 		 bool monitor, std::vector<std::string> input_dirs,
 		 std::string output_dir, std::string failed_dir,
 		 std::string forward_dir, std::string dbfile,
