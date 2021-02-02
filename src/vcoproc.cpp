@@ -35,6 +35,7 @@ Usage(const char *progname)
 	    << "    -h (show this help and exit)" << std::endl
 	    << "    -V (print version info and exit)" << std::endl
 	    << "    -v (increase verbosity level)" << std::endl
+	    << "    -s SOURCE_NAME (origin name)" << std::endl
 	    << "    -i INPUT_DIR (add directory to look for files)" << std::endl
 	    << "    -o OUTPUT_DIR (directory where to store "
 	       "JSON processing output)"
@@ -559,6 +560,7 @@ class VCoproc {
 	int verbose  = 0;
 	bool consume = false;
 	bool monitor = false;
+	std::string source;
 	std::vector<std::string> input_dirs;
 	std::string output_dir;
 	std::string failed_dir;
@@ -599,25 +601,27 @@ class VCoproc {
     public:
 	static std::unique_ptr<VCoproc> Create(
 	    int stopfd, int verbose, bool consume, bool monitor,
-	    std::vector<std::string> input_dirs, std::string output_dir,
-	    std::string failed_dir, std::string forward_dir, std::string dbfile,
-	    std::string host, unsigned short port);
+	    std::string source, std::vector<std::string> input_dirs,
+	    std::string output_dir, std::string failed_dir,
+	    std::string forward_dir, std::string dbfile, std::string host,
+	    unsigned short port);
 
 	VCoproc(int stopfd, CURLM *curlm, int verbose, bool consume,
-		bool monitor, std::vector<std::string> input_dirs,
-		std::string output_dir, std::string failed_dir,
-		std::string forward_dir, std::string dbfile,
-		std::unique_ptr<SQLiteDbConn> dbconn, std::string host,
-		unsigned short port);
+		bool monitor, std::string source,
+		std::vector<std::string> input_dirs, std::string output_dir,
+		std::string failed_dir, std::string forward_dir,
+		std::string dbfile, std::unique_ptr<SQLiteDbConn> dbconn,
+		std::string host, unsigned short port);
 	~VCoproc();
 	int MainLoop();
 };
 
 std::unique_ptr<VCoproc>
 VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
-		std::vector<std::string> input_dirs, std::string output_dir,
-		std::string failed_dir, std::string forward_dir,
-		std::string dbfile, std::string host, unsigned short port)
+		std::string source, std::vector<std::string> input_dirs,
+		std::string output_dir, std::string failed_dir,
+		std::string forward_dir, std::string dbfile, std::string host,
+		unsigned short port)
 {
 	if (input_dirs.empty()) {
 		std::cerr << logb(LogErr) << "No input directories specified"
@@ -704,23 +708,24 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 	}
 
 	return std::make_unique<VCoproc>(
-	    stopfd, curlm, verbose, consume, monitor, std::move(input_dirs),
-	    std::move(output_dir), std::move(failed_dir),
+	    stopfd, curlm, verbose, consume, monitor, std::move(source),
+	    std::move(input_dirs), std::move(output_dir), std::move(failed_dir),
 	    std::move(forward_dir), std::move(dbfile), std::move(dbconn),
 	    std::move(host), port);
 }
 
 VCoproc::VCoproc(int stopfd, CURLM *curlm, int verbose, bool consume,
-		 bool monitor, std::vector<std::string> input_dirs,
-		 std::string output_dir, std::string failed_dir,
-		 std::string forward_dir, std::string dbfile,
-		 std::unique_ptr<SQLiteDbConn> dbconn, std::string host,
-		 unsigned short port)
+		 bool monitor, std::string source,
+		 std::vector<std::string> input_dirs, std::string output_dir,
+		 std::string failed_dir, std::string forward_dir,
+		 std::string dbfile, std::unique_ptr<SQLiteDbConn> dbconn,
+		 std::string host, unsigned short port)
     : stopfd(stopfd),
       curlm(curlm),
       verbose(verbose),
       consume(consume),
       monitor(monitor),
+      source(std::move(source)),
       input_dirs(std::move(input_dirs)),
       output_dir(std::move(output_dir)),
       failed_dir(std::move(failed_dir)),
@@ -1210,6 +1215,7 @@ main(int argc, char **argv)
 	std::string failed_dir;
 	std::string forward_dir;
 	std::string dbfile;
+	std::string source;
 	std::string host;
 	unsigned short port = 0;
 	struct sigaction sa;
@@ -1252,7 +1258,7 @@ main(int argc, char **argv)
 		return ret;
 	}
 
-	while ((opt = getopt(argc, argv, "hVvi:o:F:f:cmD:H:p:")) != -1) {
+	while ((opt = getopt(argc, argv, "hVvi:o:F:f:cmD:H:p:s:")) != -1) {
 		switch (opt) {
 		case 'h':
 			Usage(argv[0]);
@@ -1266,6 +1272,10 @@ main(int argc, char **argv)
 
 		case 'v':
 			verbose++;
+			break;
+
+		case 's':
+			source = optarg;
 			break;
 
 		case 'i': {
@@ -1341,8 +1351,8 @@ main(int argc, char **argv)
 	curl_global_init(CURL_GLOBAL_ALL);
 
 	auto vcoproc = VCoproc::Create(
-	    stopfd_global, verbose, consume, monitor, std::move(input_dirs),
-	    std::move(output_dir), std::move(failed_dir),
+	    stopfd_global, verbose, consume, monitor, std::move(source),
+	    std::move(input_dirs), std::move(output_dir), std::move(failed_dir),
 	    std::move(forward_dir), dbfile, host, port);
 	if (vcoproc == nullptr) {
 		return -1;
