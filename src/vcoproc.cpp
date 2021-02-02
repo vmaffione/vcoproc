@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstring>
 #include <curl/curl.h>
 #include <deque>
@@ -60,6 +61,22 @@ PrintVersionInfo()
 		  << "    release version  : " << VC_VERSION << std::endl
 		  << "    build id         : " << VC_REVISION_ID << std::endl
 		  << "    build date       : " << VC_REVISION_DATE << std::endl;
+}
+
+float
+MsecsElapsed(std::chrono::time_point<std::chrono::system_clock> tstart)
+{
+	auto tend  = std::chrono::system_clock::now();
+	auto usecs = std::chrono::duration_cast<std::chrono::microseconds>(
+	    tend - tstart);
+
+	return usecs.count() / 1000.0;
+}
+
+float
+SecsElapsed(std::chrono::time_point<std::chrono::system_clock> tstart)
+{
+	return MsecsElapsed(tstart) / 1000.0;
 }
 
 UniqueFd stopfd_global;
@@ -541,6 +558,18 @@ class VCoproc {
 	unsigned short port  = 0;
 	size_t input_dir_idx = 0;
 
+	struct {
+		uint64_t files_scored	 = 0;
+		uint64_t bytes_scored	 = 0;
+		uint64_t files_nomdata	 = 0;
+		uint64_t bytes_nomdata	 = 0;
+		uint64_t files_failed	 = 0;
+		uint64_t bytes_failed	 = 0;
+		uint64_t files_completed = 0;
+		uint64_t bytes_completed = 0;
+	} stats;
+	std::chrono::time_point<std::chrono::system_clock> stats_start;
+
 	/*
 	 * Max number of in progress entries that we allow in the
 	 * pending table at any time.
@@ -554,6 +583,7 @@ class VCoproc {
 	int FetchFilesFromDir(const std::string &dir,
 			      std::deque<std::string> &frontier, int &credits);
 	int CleanupCompleted();
+	int UpdateStatistics();
 
     public:
 	static std::unique_ptr<VCoproc> Create(
@@ -633,14 +663,33 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		return nullptr;
 	}
 
-	/* Create the proc table if it does not exist already. */
-	std::stringstream qss;
-	qss << "CREATE TABLE IF NOT EXISTS proc ("
-	    << "src_path VARCHAR(255) PRIMARY KEY NOT NULL, "
-	    << "status TINYINT NOT NULL, "
-	    << "mjson TEXT)";
-	if (dbconn->ModifyStmt(qss, verbose)) {
-		return nullptr;
+	/* Create the proc and stats tables if they do not exist already. */
+	{
+		std::stringstream qss;
+		qss << "CREATE TABLE IF NOT EXISTS proc ("
+		    << "src_path VARCHAR(255) PRIMARY KEY NOT NULL, "
+		    << "status TINYINT NOT NULL, "
+		    << "mjson TEXT)";
+		if (dbconn->ModifyStmt(qss, verbose)) {
+			return nullptr;
+		}
+	}
+	{
+		std::stringstream qss;
+		qss << "CREATE TABLE IF NOT EXISTS stats ("
+		    << "timestamp UNSIGNED INTEGER PRIMARY KEY NOT NULL, "
+		    << "files_scored UNSIGNED INTEGER NOT NULL, "
+		    << "bytes_scored UNSIGNED INTEGER NOT NULL, "
+		    << "files_nomdata UNSIGNED INTEGER NOT NULL, "
+		    << "bytes_nomdata UNSIGNED INTEGER NOT NULL, "
+		    << "files_failed UNSIGNED INTEGER NOT NULL, "
+		    << "bytes_failed UNSIGNED INTEGER NOT NULL, "
+		    << "files_completed UNSIGNED INTEGER NOT NULL, "
+		    << "bytes_completed UNSIGNED INTEGER NOT NULL"
+		    << ")";
+		if (dbconn->ModifyStmt(qss, verbose)) {
+			return nullptr;
+		}
 	}
 
 	return std::make_unique<VCoproc>(
@@ -668,7 +717,8 @@ VCoproc::VCoproc(int stopfd, CURLM *curlm, int verbose, bool consume,
       dbfile(std::move(dbfile)),
       dbconn(std::move(dbconn)),
       host(std::move(host)),
-      port(port)
+      port(port),
+      stats_start(std::chrono::system_clock::now())
 {
 }
 
@@ -860,6 +910,33 @@ VCoproc::CleanupCompleted()
 }
 
 int
+VCoproc::UpdateStatistics()
+{
+	std::stringstream qss;
+
+	if (SecsElapsed(stats_start) < 2) {
+		return 0;
+	}
+
+	qss << "INSERT INTO stats(timestamp, files_scored, "
+	       "bytes_scored, files_nomdata, bytes_nomdata, "
+	       "files_failed, bytes_failed, files_completed, "
+	       "bytes_completed) VALUES(strftime('%s','now'), "
+	    << stats.files_scored << "," << stats.bytes_scored << ","
+	    << stats.files_nomdata << "," << stats.bytes_nomdata << ","
+	    << stats.files_failed << "," << stats.bytes_failed << ","
+	    << stats.files_completed << "," << stats.bytes_completed << ")";
+	if (dbconn->ModifyStmt(qss, verbose)) {
+		return -1;
+	}
+
+	stats_start = std::chrono::system_clock::now();
+	stats	    = {};
+
+	return 0;
+}
+
+int
 VCoproc::MainLoop()
 {
 	bool forward = !forward_dir.empty();
@@ -991,10 +1068,24 @@ VCoproc::MainLoop()
 				fout << std::endl;
 			}
 
+			long long int file_size = FileSize(p->FilePath());
+			if (file_size < 0) {
+				file_size = 44; /* Typical RIFF header size */
+			}
+
 			if (!success) {
 				p->SetStatus(ProcStatus::ProcFailure);
+				stats.files_failed++;
+				stats.bytes_failed += file_size;
 			} else {
 				p->SetStatus(ProcStatus::ProcSuccess);
+				if (jsresp["status"] == "COMPLETE") {
+					stats.files_scored++;
+					stats.bytes_scored += file_size;
+				} else {
+					stats.files_nomdata++;
+					stats.bytes_nomdata += file_size;
+				}
 			}
 		}
 
@@ -1049,6 +1140,13 @@ VCoproc::MainLoop()
 				/* success && !consume && !forward */
 			}
 
+			long long int file_size = FileSize(proc->FilePath());
+			if (file_size < 0) {
+				file_size = 44; /* Typical RIFF header size */
+			}
+			stats.files_completed++;
+			stats.bytes_completed += file_size;
+
 			proc->SetStatus(ProcStatus::Complete);
 		}
 
@@ -1061,6 +1159,9 @@ VCoproc::MainLoop()
 		if (err) {
 			break;
 		}
+
+		/* Update the statistics. */
+		UpdateStatistics();
 
 		/*
 		 * When there are no more files to be processed or pending
