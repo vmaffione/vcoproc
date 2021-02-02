@@ -318,7 +318,8 @@ class PendingProc {
 	CURLM *curlm = nullptr;
 	CURL *curl   = nullptr;
 	std::string src_path;
-	int verbose = 0;
+	size_t src_size = 0;
+	int verbose	= 0;
 	std::string postdata;
 
 	CurlStatus curl_status = CurlStatus::Idle;
@@ -327,8 +328,12 @@ class PendingProc {
 
     public:
 	PendingProc(CURLM *curlm, CURL *curl, const std::string &src_path,
-		    int verbose)
-	    : curlm(curlm), curl(curl), src_path(src_path), verbose(verbose)
+		    size_t src_size, int verbose)
+	    : curlm(curlm),
+	      curl(curl),
+	      src_path(src_path),
+	      src_size(src_size),
+	      verbose(verbose)
 	{
 	}
 
@@ -337,6 +342,7 @@ class PendingProc {
 	ProcStatus Status() const { return proc_status; }
 	void SetStatus(ProcStatus status);
 	std::string FilePath() const { return src_path; }
+	size_t FileSize() const { return src_size; }
 	static std::unique_ptr<PendingProc> Create(CURLM *curlm,
 						   const std::string &src_path,
 						   int verbose);
@@ -381,8 +387,13 @@ PendingProc::Create(CURLM *curlm, const std::string &src_path, int verbose)
 		return nullptr;
 	}
 
-	auto proc =
-	    std::make_unique<PendingProc>(curlm, curl, src_path, verbose);
+	long long int src_size = utils::FileSize(src_path);
+	if (src_size < 0) {
+		return nullptr;
+	}
+
+	auto proc = std::make_unique<PendingProc>(
+	    curlm, curl, src_path, static_cast<size_t>(src_size), verbose);
 
 	/* Link the new PendingProc instance to the curl handle. */
 	cc = curl_easy_setopt(curl, CURLOPT_PRIVATE, (void *)proc.get());
@@ -1068,23 +1079,18 @@ VCoproc::MainLoop()
 				fout << std::endl;
 			}
 
-			long long int file_size = FileSize(p->FilePath());
-			if (file_size < 0) {
-				file_size = 44; /* Typical RIFF header size */
-			}
-
 			if (!success) {
 				p->SetStatus(ProcStatus::ProcFailure);
 				stats.files_failed++;
-				stats.bytes_failed += file_size;
+				stats.bytes_failed += p->FileSize();
 			} else {
 				p->SetStatus(ProcStatus::ProcSuccess);
 				if (jsresp["status"] == "COMPLETE") {
 					stats.files_scored++;
-					stats.bytes_scored += file_size;
+					stats.bytes_scored += p->FileSize();
 				} else {
 					stats.files_nomdata++;
-					stats.bytes_nomdata += file_size;
+					stats.bytes_nomdata += p->FileSize();
 				}
 			}
 		}
@@ -1140,12 +1146,8 @@ VCoproc::MainLoop()
 				/* success && !consume && !forward */
 			}
 
-			long long int file_size = FileSize(proc->FilePath());
-			if (file_size < 0) {
-				file_size = 44; /* Typical RIFF header size */
-			}
 			stats.files_completed++;
-			stats.bytes_completed += file_size;
+			stats.bytes_completed += proc->FileSize();
 
 			proc->SetStatus(ProcStatus::Complete);
 		}
