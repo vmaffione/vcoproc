@@ -711,6 +711,7 @@ class VCoproc {
 			      std::deque<std::string> &frontier, int &credits);
 	int CleanupCompleted();
 	int UpdateStatistics();
+	int WaitForBackend();
 
     public:
 	static std::unique_ptr<VCoproc> Create(
@@ -1080,6 +1081,60 @@ VCoproc::UpdateStatistics()
 	return 0;
 }
 
+/*
+ * Wait for the backend to come online.
+ */
+int
+VCoproc::WaitForBackend()
+{
+	unsigned int milliseconds = 5000;
+	struct pollfd pfd[1];
+
+	pfd[0].fd     = stopfd;
+	pfd[0].events = POLLIN;
+
+	do {
+		int ret = poll(pfd, 1, /*timeout_ms=*/milliseconds);
+
+		if (ret < 0) {
+			if (errno == EINTR) {
+				/*
+				 * This happens if a signal was caught
+				 * during poll. We just continue, so that
+				 * the signal handler can write to the
+				 * stopfd and poll() returns 1.
+				 */
+				continue;
+			}
+			std::cerr << logb(LogErr)
+				  << "poll() failed: " << strerror(errno)
+				  << std::endl;
+			return ret;
+		}
+
+		if (ret > 0) {
+			/*
+			 * We got a termination signal. Return 1 to inform
+			 * the user.
+			 */
+			assert(pfd[0].revents & POLLIN);
+			EventFdDrain(stopfd);
+
+			return 1;
+		}
+
+		/*
+		 * It's safer to have the sleep before the first check
+		 * to rate limit this function (e.g., if Probe() always
+		 * returns true but there is some issue that triggers the
+		 * MainLoop to call WaitForBackend() again and again).
+		 */
+	} while (be->Probe() == false);
+
+	/* Backend is online. We can return. */
+	return 0;
+}
+
 int
 VCoproc::MainLoop()
 {
@@ -1095,6 +1150,8 @@ VCoproc::MainLoop()
 	int err = 0;
 
 	while (!bail_out) {
+		bool backend_down = false;
+
 		/*
 		 * Refill the pending table by fetching more files from the
 		 * input directories.
@@ -1168,6 +1225,10 @@ VCoproc::MainLoop()
 				    << "Failed to get CURLINFO_RESPONSE_CODE: "
 				    << curl_easy_strerror(cc) << std::endl;
 				http_code = 400;
+			}
+
+			if (http_code == 0) {
+				backend_down = true;
 			}
 
 			bool success = (http_code == 200);
@@ -1301,6 +1362,29 @@ VCoproc::MainLoop()
 		 */
 		if (num_running_curls == 0 && new_files == 0 && !monitor) {
 			break;
+		}
+
+		if (backend_down) {
+			/*
+			 * The backend went down for some reason.
+			 * Flush any pending requests and wait
+			 * for the backend to go back online.
+			 */
+			int ret;
+
+			pending.clear();
+
+			std::cout << "Backend went offline. Waiting ..."
+				  << std::endl;
+			ret = WaitForBackend();
+			if (ret != 0) {
+				/*
+				 * Stop on error (ret < 0) or because we got
+				 * the termination signal (ret > 0).
+				 */
+				break;
+			}
+			std::cout << "Backend is back online!" << std::endl;
 		}
 
 		/*
