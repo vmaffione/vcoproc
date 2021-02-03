@@ -562,7 +562,8 @@ PendingProc::CompletePost(json11::Json::object &jsresp)
 
 class Backend {
     public:
-	virtual bool Probe() = 0;
+	virtual bool Probe()		    = 0;
+	virtual std::string BaseUrl() const = 0;
 };
 
 class PsBackend : public Backend {
@@ -604,6 +605,14 @@ PsBackend::Probe()
 		return false;
 	}
 
+	/* Write callback to push data to a local stringstream variable. */
+	std::stringstream getresp;
+	auto writef = [](void *data, size_t size, size_t nitems, void *userp) {
+		std::stringstream *getresp = (std::stringstream *)userp;
+		getresp->write((const char *)data, size * nitems);
+		return size * nitems;
+	};
+
 	cc = curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
 	if (cc != CURLE_OK) {
 		std::cerr << "Failed to set CURLOPT_URL: "
@@ -614,6 +623,24 @@ PsBackend::Probe()
 	cc = curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
 	if (cc != CURLE_OK) {
 		std::cerr << "Failed to set CURLOPT_HTTPGET: "
+			  << curl_easy_strerror(cc) << std::endl;
+		goto end;
+	}
+
+	/*
+	 * The "+" magic forces a conversion to a C-style function pointer.
+	 * The writef function cannot have captures.
+	 */
+	cc = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +writef);
+	if (cc != CURLE_OK) {
+		std::cerr << "Failed to set CURLOPT_READFUNCTION: "
+			  << curl_easy_strerror(cc) << std::endl;
+		goto end;
+	}
+
+	cc = curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&getresp);
+	if (cc != CURLE_OK) {
+		std::cerr << "Failed to set CURLOPT_READDATA: "
 			  << curl_easy_strerror(cc) << std::endl;
 		goto end;
 	}
@@ -1067,13 +1094,6 @@ VCoproc::MainLoop()
 	std::string base_url;
 	int err = 0;
 
-	{
-		// TODO move to a backend class
-		std::stringstream u;
-		u << "http://" << host << ":" << port;
-		base_url = u.str();
-	}
-
 	while (!bail_out) {
 		/*
 		 * Refill the pending table by fetching more files from the
@@ -1101,7 +1121,8 @@ VCoproc::MainLoop()
 			json11::Json jsreq = json11::Json::object{
 			    {"file_name", proc->FilePath()},
 			};
-			if (proc->PreparePost(base_url + "/process", jsreq)) {
+			if (proc->PreparePost(be->BaseUrl() + "/process",
+					      jsreq)) {
 				continue;
 			}
 			proc->SetStatus(ProcStatus::Waiting);
