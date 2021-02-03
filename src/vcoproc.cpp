@@ -592,7 +592,51 @@ PsBackend::PsBackend(std::string base_url) : base_url(base_url) {}
 bool
 PsBackend::Probe()
 {
-	return true;
+	std::string url = base_url + std::string("/ping");
+	long http_code	= 0;
+	CURLcode cc;
+	CURL *curl;
+
+	curl = curl_easy_init();
+	if (curl == nullptr) {
+		std::cerr << logb(LogErr) << "Failed to create CURL easy handle"
+			  << std::endl;
+		return false;
+	}
+
+	cc = curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+	if (cc != CURLE_OK) {
+		std::cerr << "Failed to set CURLOPT_URL: "
+			  << curl_easy_strerror(cc) << std::endl;
+		goto end;
+	}
+
+	cc = curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+	if (cc != CURLE_OK) {
+		std::cerr << "Failed to set CURLOPT_HTTPGET: "
+			  << curl_easy_strerror(cc) << std::endl;
+		goto end;
+	}
+
+	cc = curl_easy_perform(curl);
+	if (cc != CURLE_OK) {
+		std::cerr << "Failed to perform request: "
+			  << curl_easy_strerror(cc) << std::endl;
+		goto end;
+	} else {
+		cc =
+		    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+		if (cc != CURLE_OK) {
+			std::cerr << "Failed to get CURLINFO_RESPONSE_CODE: "
+				  << curl_easy_strerror(cc) << std::endl;
+			goto end;
+		}
+	}
+
+end:
+	curl_easy_cleanup(curl);
+
+	return http_code == 200;
 }
 
 /* Main class. */
@@ -712,13 +756,6 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		consume = true;
 	}
 
-	CURLM *curlm = curl_multi_init();
-	if (curlm == nullptr) {
-		std::cerr << logb(LogErr)
-			  << "Failed to create CURL multi handle" << std::endl;
-		return nullptr;
-	}
-
 	auto be = PsBackend::Create(host, port);
 	if (be == nullptr) {
 		std::cerr << logb(LogErr) << "Failed to create backend"
@@ -761,6 +798,13 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		if (dbconn->ModifyStmt(qss, verbose)) {
 			return nullptr;
 		}
+	}
+
+	CURLM *curlm = curl_multi_init();
+	if (curlm == nullptr) {
+		std::cerr << logb(LogErr)
+			  << "Failed to create CURL multi handle" << std::endl;
+		return nullptr;
 	}
 
 	return std::make_unique<VCoproc>(

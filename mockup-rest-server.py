@@ -64,13 +64,13 @@ class TestRequestHandler(myhttp.RequestHandler):
                 p = myhttp.url_unescape(ppath.path)
 
                 if p.startswith('/ping'):
-                        self.do_GET_ping(p)
+                        return self.do_GET_ping(p)
                 else:
-                        self.return_error(404)
+                        return self.return_error(404)
 
         def do_GET_ping(self, path):
                 jsresp = {'status': 'COMPLETE'}
-                return jsresp
+                return self.return_json(jsresp)
 
         def do_POST(self):
                 ppath = myhttp.myurlparse(self.path)
