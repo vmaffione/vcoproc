@@ -351,7 +351,7 @@ class PendingProc {
 					void *userp);
 	void AppendResponse(void *data, size_t size);
 	int PreparePost(const std::string &url, const json11::Json &jsreq);
-	int CompletePost(json11::Json &jsresp);
+	int CompletePost(json11::Json::object &jsresp);
 };
 
 std::unique_ptr<PendingProc>
@@ -527,7 +527,7 @@ PendingProc::PreparePost(const std::string &url, const json11::Json &jsreq)
 }
 
 int
-PendingProc::CompletePost(json11::Json &jsresp)
+PendingProc::CompletePost(json11::Json::object &jsresp)
 {
 	std::string errs;
 
@@ -538,13 +538,14 @@ PendingProc::CompletePost(json11::Json &jsresp)
 		return -1;
 	}
 
-	jsresp = json11::Json::parse(postresp.str(), errs);
-	if (!errs.empty() && jsresp == json11::Json()) {
+	json11::Json js = json11::Json::parse(postresp.str(), errs);
+	if (!errs.empty() && js == json11::Json()) {
 		std::cerr << logb(LogErr)
 			  << "Response is not a JSON: " << postresp.str()
 			  << std::endl;
 		return -1;
 	}
+	jsresp = js.object_items();
 
 	/* Reset CURL status to allow more requests. */
 	curl_status = CurlStatus::Idle;
@@ -1049,7 +1050,7 @@ VCoproc::MainLoop()
 			}
 
 			bool success = (http_code == 200);
-			json11::Json jsresp;
+			json11::Json::object jsresp;
 
 			if (p->CompletePost(jsresp)) {
 				success = false;
@@ -1058,11 +1059,12 @@ VCoproc::MainLoop()
 			if (verbose) {
 				std::cout << logb(LogDbg) << "Processed "
 					  << p->FilePath() << " --> "
-					  << http_code << " " << jsresp.dump()
+					  << http_code << " "
+					  << json11::Json(jsresp).dump()
 					  << std::endl;
 			}
 
-			if (!jsresp.has_key("status")) {
+			if (!jsresp.count("status")) {
 				std::cerr << logb(LogErr)
 					  << "Missing status key" << std::endl;
 				success = false;
@@ -1077,10 +1079,12 @@ VCoproc::MainLoop()
 				    FileBaseName(p->FilePath());
 				std::string jspath;
 
+				jsresp["origin"] = source;
+
 				jsname = PathNameNoExt(jsname) + ".json";
 				jspath = PathJoin(output_dir, jsname);
 				std::ofstream fout(jspath);
-				fout << jsresp.dump();
+				fout << json11::Json(jsresp).dump();
 				fout << std::endl;
 			}
 
