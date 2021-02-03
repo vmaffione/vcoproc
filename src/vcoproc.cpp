@@ -529,6 +529,7 @@ PendingProc::PreparePost(const std::string &url, const json11::Json &jsreq)
 int
 PendingProc::CompletePost(json11::Json::object &jsresp)
 {
+	std::string respstr;
 	std::string errs;
 
 	if (curl_status != CurlStatus::Prepared) {
@@ -538,11 +539,16 @@ PendingProc::CompletePost(json11::Json::object &jsresp)
 		return -1;
 	}
 
-	json11::Json js = json11::Json::parse(postresp.str(), errs);
+	respstr = postresp.str();
+	if (respstr.empty()) {
+		std::cerr << logb(LogErr) << "Response is empty" << std::endl;
+		return -1;
+	}
+
+	json11::Json js = json11::Json::parse(respstr, errs);
 	if (!errs.empty() && js == json11::Json()) {
 		std::cerr << logb(LogErr)
-			  << "Response is not a JSON: " << postresp.str()
-			  << std::endl;
+			  << "Response is not a JSON: " << respstr << std::endl;
 		return -1;
 	}
 	jsresp = js.object_items();
