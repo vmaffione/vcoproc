@@ -560,10 +560,46 @@ PendingProc::CompletePost(json11::Json::object &jsresp)
 	return 0;
 }
 
+class Backend {
+    public:
+	virtual bool Probe() = 0;
+};
+
+class PsBackend : public Backend {
+	std::string base_url;
+
+    public:
+	static std::unique_ptr<Backend> Create(std::string host,
+					       unsigned short port);
+	PsBackend(std::string base_url);
+	virtual bool Probe();
+
+	std::string BaseUrl() const { return base_url; }
+};
+
+std::unique_ptr<Backend>
+PsBackend::Create(std::string host, unsigned short port)
+{
+	std::stringstream base_url;
+
+	base_url << "http://" << host << ":" << port;
+
+	return std::make_unique<PsBackend>(base_url.str());
+}
+
+PsBackend::PsBackend(std::string base_url) : base_url(base_url) {}
+
+bool
+PsBackend::Probe()
+{
+	return true;
+}
+
 /* Main class. */
 class VCoproc {
 	int stopfd   = -1; /* owned by the caller, not by us */
 	CURLM *curlm = nullptr;
+	std::unique_ptr<Backend> be;
 	int verbose  = 0;
 	bool consume = false;
 	bool monitor = false;
@@ -613,8 +649,8 @@ class VCoproc {
 	    std::string forward_dir, std::string dbfile, std::string host,
 	    unsigned short port);
 
-	VCoproc(int stopfd, CURLM *curlm, int verbose, bool consume,
-		bool monitor, std::string source,
+	VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend>, int verbose,
+		bool consume, bool monitor, std::string source,
 		std::vector<std::string> input_dirs, std::string output_dir,
 		std::string failed_dir, std::string forward_dir,
 		std::string dbfile, std::unique_ptr<SQLiteDbConn> dbconn,
@@ -630,6 +666,12 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		std::string forward_dir, std::string dbfile, std::string host,
 		unsigned short port)
 {
+	if (source.empty()) {
+		std::cerr << logb(LogErr) << "No source/origin specified"
+			  << std::endl;
+		return nullptr;
+	}
+
 	if (input_dirs.empty()) {
 		std::cerr << logb(LogErr) << "No input directories specified"
 			  << std::endl;
@@ -677,6 +719,13 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		return nullptr;
 	}
 
+	auto be = PsBackend::Create(host, port);
+	if (be == nullptr) {
+		std::cerr << logb(LogErr) << "Failed to create backend"
+			  << std::endl;
+		return nullptr;
+	}
+
 	/* Open a (long-lived) database connection. */
 	auto dbconn = SQLiteDbConn::Create(dbfile);
 	if (dbconn == nullptr) {
@@ -715,20 +764,21 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 	}
 
 	return std::make_unique<VCoproc>(
-	    stopfd, curlm, verbose, consume, monitor, std::move(source),
-	    std::move(input_dirs), std::move(output_dir), std::move(failed_dir),
-	    std::move(forward_dir), std::move(dbfile), std::move(dbconn),
-	    std::move(host), port);
+	    stopfd, curlm, std::move(be), verbose, consume, monitor,
+	    std::move(source), std::move(input_dirs), std::move(output_dir),
+	    std::move(failed_dir), std::move(forward_dir), std::move(dbfile),
+	    std::move(dbconn), std::move(host), port);
 }
 
-VCoproc::VCoproc(int stopfd, CURLM *curlm, int verbose, bool consume,
-		 bool monitor, std::string source,
+VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
+		 int verbose, bool consume, bool monitor, std::string source,
 		 std::vector<std::string> input_dirs, std::string output_dir,
 		 std::string failed_dir, std::string forward_dir,
 		 std::string dbfile, std::unique_ptr<SQLiteDbConn> dbconn,
 		 std::string host, unsigned short port)
     : stopfd(stopfd),
       curlm(curlm),
+      be(std::move(be)),
       verbose(verbose),
       consume(consume),
       monitor(monitor),
