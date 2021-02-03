@@ -1228,7 +1228,12 @@ VCoproc::MainLoop()
 			}
 
 			if (http_code == 0) {
+				/*
+				 * Backend down. No reason to advance the
+				 * pending requests. Those will be reprocessed.
+				 */
 				backend_down = true;
+				break;
 			}
 
 			bool success = (http_code == 200);
@@ -1284,6 +1289,37 @@ VCoproc::MainLoop()
 					stats.bytes_nomdata += p->FileSize();
 				}
 			}
+		}
+
+		if (backend_down) {
+			/*
+			 * The backend went down for some reason.
+			 * Flush any pending requests and wait
+			 * for the backend to go back online.
+			 */
+			int ret;
+
+			// TODO maybe clear only the ones in Waiting state
+			pending.clear();
+
+			std::cout << "Backend went offline. Waiting ..."
+				  << std::endl;
+			ret = WaitForBackend();
+			if (ret != 0) {
+				/*
+				 * Stop on error (ret < 0) or because we got
+				 * the termination signal (ret > 0).
+				 */
+				break;
+			}
+			std::cout << "Backend is back online!" << std::endl;
+
+			/*
+			 * It's convenient to start from the beginning
+			 * of the iteration, so that we fetch more files,
+			 * including the ones to reprocess.
+			 */
+			continue;
 		}
 
 		/*
@@ -1362,29 +1398,6 @@ VCoproc::MainLoop()
 		 */
 		if (num_running_curls == 0 && new_files == 0 && !monitor) {
 			break;
-		}
-
-		if (backend_down) {
-			/*
-			 * The backend went down for some reason.
-			 * Flush any pending requests and wait
-			 * for the backend to go back online.
-			 */
-			int ret;
-
-			pending.clear();
-
-			std::cout << "Backend went offline. Waiting ..."
-				  << std::endl;
-			ret = WaitForBackend();
-			if (ret != 0) {
-				/*
-				 * Stop on error (ret < 0) or because we got
-				 * the termination signal (ret > 0).
-				 */
-				break;
-			}
-			std::cout << "Backend is back online!" << std::endl;
 		}
 
 		/*
