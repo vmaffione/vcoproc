@@ -396,11 +396,11 @@ PendingFile::Create(CURLM *curlm, const std::string &src_path, int verbose)
 		return nullptr;
 	}
 
-	auto proc = std::make_unique<PendingFile>(
+	auto pf = std::make_unique<PendingFile>(
 	    curlm, curl, src_path, static_cast<size_t>(src_size), verbose);
 
 	/* Link the new PendingFile instance to the curl handle. */
-	cc = curl_easy_setopt(curl, CURLOPT_PRIVATE, (void *)proc.get());
+	cc = curl_easy_setopt(curl, CURLOPT_PRIVATE, (void *)pf.get());
 	if (cc != CURLE_OK) {
 		std::cerr << "Failed to set CURLOPT_PRIVATE: "
 			  << curl_easy_strerror(cc) << std::endl;
@@ -408,14 +408,14 @@ PendingFile::Create(CURLM *curlm, const std::string &src_path, int verbose)
 	}
 
 	/* Link the new PendingFile instance to our write callback. */
-	cc = curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)proc.get());
+	cc = curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)pf.get());
 	if (cc != CURLE_OK) {
 		std::cerr << "Failed to set CURLOPT_WRITEDATA: "
 			  << curl_easy_strerror(cc) << std::endl;
 		return nullptr;
 	}
 
-	return proc;
+	return pf;
 }
 
 PendingFile::~PendingFile()
@@ -438,11 +438,11 @@ size_t
 PendingFile::CurlWriteCallback(void *data, size_t size, size_t nmemb,
 			       void *userp)
 {
-	size_t chunksz	  = size * nmemb;
-	PendingFile *proc = reinterpret_cast<PendingFile *>(userp);
+	size_t chunksz	= size * nmemb;
+	PendingFile *pf = reinterpret_cast<PendingFile *>(userp);
 
-	assert(proc != nullptr);
-	proc->AppendResponse(data, chunksz);
+	assert(pf != nullptr);
+	pf->AppendResponse(data, chunksz);
 
 	return chunksz;
 }
@@ -711,7 +711,7 @@ class VCoproc {
 	 */
 	static constexpr size_t MaxEntries = 5;
 
-	/* Map of in-progress proc entries. */
+	/* Map of in-progress pf entries. */
 	std::unordered_map<std::string, std::unique_ptr<PendingFile>> pending;
 
 	int FetchMoreFiles();
@@ -1044,24 +1044,24 @@ int
 VCoproc::CleanupCompleted()
 {
 	for (auto it = pending.begin(); it != pending.end();) {
-		auto &proc = it->second;
+		auto &pf = it->second;
 
 		/*
 		 * Don't remove the entry from the pending
 		 * table if we are not consuming the files,
 		 * otherwise we would reprocess it.
 		 */
-		if (proc->Status() == ProcStatus::Complete && consume) {
+		if (pf->Status() == ProcStatus::Complete && consume) {
 			if (verbose) {
 				std::cout << logb(LogDbg) << "Completed "
-					  << proc->FilePath() << std::endl;
+					  << pf->FilePath() << std::endl;
 			}
 			it = pending.erase(it);
-		} else if (proc->Status() == ProcStatus::Waiting &&
-			   proc->InactivitySeconds() > 1) {
+		} else if (pf->Status() == ProcStatus::Waiting &&
+			   pf->InactivitySeconds() > 1) {
 			if (verbose) {
 				std::cout << logb(LogDbg) << "Timed out "
-					  << proc->FilePath() << std::endl;
+					  << pf->FilePath() << std::endl;
 			}
 			it = pending.erase(it);
 		} else {
@@ -1076,17 +1076,17 @@ int
 VCoproc::TimeoutWaiting()
 {
 	for (auto &kv : pending) {
-		auto &proc = kv.second;
+		auto &pf = kv.second;
 
-		if (proc->Status() == ProcStatus::Waiting &&
-		    proc->InactivitySeconds() > 1) {
-			proc->SetStatus(ProcStatus::ProcFailure);
-			std::cerr << logb(LogErr) << "File " << proc->FilePath()
+		if (pf->Status() == ProcStatus::Waiting &&
+		    pf->InactivitySeconds() > 1) {
+			pf->SetStatus(ProcStatus::ProcFailure);
+			std::cerr << logb(LogErr) << "File " << pf->FilePath()
 				  << " timed out" << std::endl;
 			stats.files_failed++;
-			stats.bytes_failed += proc->FileSize();
+			stats.bytes_failed += pf->FileSize();
 			stats.files_timedout++;
-			stats.bytes_timedout += proc->FileSize();
+			stats.bytes_timedout += pf->FileSize();
 		}
 	}
 
@@ -1208,22 +1208,22 @@ VCoproc::MainLoop()
 		 */
 		int new_files = 0;
 		for (auto &kv : pending) {
-			auto &proc = kv.second;
+			auto &pf = kv.second;
 
-			if (proc->Status() != ProcStatus::New) {
+			if (pf->Status() != ProcStatus::New) {
 				continue;
 			}
 
 			new_files++;
 
 			json11::Json jsreq = json11::Json::object{
-			    {"file_name", proc->FilePath()},
+			    {"file_name", pf->FilePath()},
 			};
-			if (proc->PreparePost(be->BaseUrl() + "/process",
-					      jsreq)) {
+			if (pf->PreparePost(be->BaseUrl() + "/process",
+					    jsreq)) {
 				continue;
 			}
-			proc->SetStatus(ProcStatus::Waiting);
+			pf->SetStatus(ProcStatus::Waiting);
 		}
 
 		/* Advance any pending POST transfers. */
@@ -1239,7 +1239,7 @@ VCoproc::MainLoop()
 		CURLMsg *msg;
 		while ((msg = curl_multi_info_read(curlm, &msgs_left)) !=
 		       nullptr) {
-			PendingFile *p;
+			PendingFile *pf;
 			long http_code;
 			CURLcode cc;
 
@@ -1250,7 +1250,7 @@ VCoproc::MainLoop()
 			}
 
 			cc = curl_easy_getinfo(msg->easy_handle,
-					       CURLINFO_PRIVATE, (char **)&p);
+					       CURLINFO_PRIVATE, (char **)&pf);
 			if (cc != CURLE_OK) {
 				std::cerr << "Failed to get CURLINFO_PRIVATE: "
 					  << curl_easy_strerror(cc)
@@ -1280,13 +1280,13 @@ VCoproc::MainLoop()
 			bool success = (http_code == 200);
 			json11::Json::object jsresp;
 
-			if (p->CompletePost(jsresp)) {
+			if (pf->CompletePost(jsresp)) {
 				success = false;
 			}
 
 			if (verbose) {
 				std::cout << logb(LogDbg) << "Processed "
-					  << p->FilePath() << " --> "
+					  << pf->FilePath() << " --> "
 					  << http_code << " "
 					  << json11::Json(jsresp).dump()
 					  << std::endl;
@@ -1304,7 +1304,7 @@ VCoproc::MainLoop()
 			if (success) {
 				/* Output JSON. */
 				std::string jsname =
-				    FileBaseName(p->FilePath());
+				    FileBaseName(pf->FilePath());
 				std::string jspath;
 
 				jsresp["origin"] = source;
@@ -1317,17 +1317,17 @@ VCoproc::MainLoop()
 			}
 
 			if (!success) {
-				p->SetStatus(ProcStatus::ProcFailure);
+				pf->SetStatus(ProcStatus::ProcFailure);
 				stats.files_failed++;
-				stats.bytes_failed += p->FileSize();
+				stats.bytes_failed += pf->FileSize();
 			} else {
-				p->SetStatus(ProcStatus::ProcSuccess);
+				pf->SetStatus(ProcStatus::ProcSuccess);
 				if (jsresp["status"] == "COMPLETE") {
 					stats.files_scored++;
-					stats.bytes_scored += p->FileSize();
+					stats.bytes_scored += pf->FileSize();
 				} else {
 					stats.files_nomdata++;
-					stats.bytes_nomdata += p->FileSize();
+					stats.bytes_nomdata += pf->FileSize();
 				}
 			}
 		}
@@ -1372,11 +1372,11 @@ VCoproc::MainLoop()
 		 */
 		for (auto &kv : pending) {
 			bool remove, copy, move, copymove, success, failure;
-			auto &proc = kv.second;
+			auto &pf = kv.second;
 			std::string dstdir;
 
-			success = proc->Status() == ProcStatus::ProcSuccess;
-			failure = proc->Status() == ProcStatus::ProcFailure;
+			success = pf->Status() == ProcStatus::ProcSuccess;
+			failure = pf->Status() == ProcStatus::ProcFailure;
 
 			if (!(success || failure)) {
 				continue;
@@ -1389,29 +1389,29 @@ VCoproc::MainLoop()
 			dstdir	 = failure ? failed_dir : forward_dir;
 
 			if (remove) {
-				if (RemoveFile(proc->FilePath())) {
+				if (RemoveFile(pf->FilePath())) {
 					bail_out = true;
 				} else if (verbose) {
 					std::cout << logb(LogDbg) << "Removed "
-						  << proc->FilePath()
+						  << pf->FilePath()
 						  << std::endl;
 				}
 
 			} else if (move) {
-				if (MoveToDir(dstdir, proc->FilePath())) {
+				if (MoveToDir(dstdir, pf->FilePath())) {
 					bail_out = true;
 				} else if (verbose) {
 					std::cout << logb(LogDbg) << "Moved "
-						  << proc->FilePath() << " --> "
+						  << pf->FilePath() << " --> "
 						  << dstdir << std::endl;
 				}
 
 			} else if (copy) {
-				if (CopyToDir(dstdir, proc->FilePath())) {
+				if (CopyToDir(dstdir, pf->FilePath())) {
 					bail_out = true;
 				} else if (verbose) {
 					std::cout << logb(LogDbg) << "Copied "
-						  << proc->FilePath() << " --> "
+						  << pf->FilePath() << " --> "
 						  << dstdir << std::endl;
 				}
 			} else {
@@ -1419,9 +1419,9 @@ VCoproc::MainLoop()
 			}
 
 			stats.files_completed++;
-			stats.bytes_completed += proc->FileSize();
+			stats.bytes_completed += pf->FileSize();
 
-			proc->SetStatus(ProcStatus::Complete);
+			pf->SetStatus(ProcStatus::Complete);
 		}
 
 		/*
