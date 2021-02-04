@@ -308,7 +308,7 @@ enum class ProcStatus {
 /*
  * A class representing an entry in the pending table.
  */
-class PendingProc {
+class PendingFile {
     public:
 	enum class CurlStatus {
 		Idle	 = 0,
@@ -322,29 +322,31 @@ class PendingProc {
 	size_t src_size = 0;
 	int verbose	= 0;
 	std::string postdata;
+	std::chrono::time_point<std::chrono::system_clock> last_activity;
 
 	CurlStatus curl_status = CurlStatus::Idle;
 	ProcStatus proc_status = ProcStatus::New;
 	std::stringstream postresp;
 
     public:
-	PendingProc(CURLM *curlm, CURL *curl, const std::string &src_path,
+	PendingFile(CURLM *curlm, CURL *curl, const std::string &src_path,
 		    size_t src_size, int verbose)
 	    : curlm(curlm),
 	      curl(curl),
 	      src_path(src_path),
 	      src_size(src_size),
-	      verbose(verbose)
+	      verbose(verbose),
+	      last_activity(std::chrono::system_clock::now())
 	{
 	}
 
-	~PendingProc();
+	~PendingFile();
 
 	ProcStatus Status() const { return proc_status; }
 	void SetStatus(ProcStatus status);
 	std::string FilePath() const { return src_path; }
 	size_t FileSize() const { return src_size; }
-	static std::unique_ptr<PendingProc> Create(CURLM *curlm,
+	static std::unique_ptr<PendingFile> Create(CURLM *curlm,
 						   const std::string &src_path,
 						   int verbose);
 	static size_t CurlWriteCallback(void *data, size_t size, size_t nmemb,
@@ -352,10 +354,11 @@ class PendingProc {
 	void AppendResponse(void *data, size_t size);
 	int PreparePost(const std::string &url, const json11::Json &jsreq);
 	int CompletePost(json11::Json::object &jsresp);
+	size_t InactivitySeconds() const { return SecsElapsed(last_activity); }
 };
 
-std::unique_ptr<PendingProc>
-PendingProc::Create(CURLM *curlm, const std::string &src_path, int verbose)
+std::unique_ptr<PendingFile>
+PendingFile::Create(CURLM *curlm, const std::string &src_path, int verbose)
 {
 	CURLcode cc;
 	CURL *curl;
@@ -373,7 +376,7 @@ PendingProc::Create(CURLM *curlm, const std::string &src_path, int verbose)
 
 	/* Set our write callback. */
 	cc = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
-			      &PendingProc::CurlWriteCallback);
+			      &PendingFile::CurlWriteCallback);
 	if (cc != CURLE_OK) {
 		std::cerr << "Failed to set CURLOPT_WRITEFUNCTION: "
 			  << curl_easy_strerror(cc) << std::endl;
@@ -393,10 +396,10 @@ PendingProc::Create(CURLM *curlm, const std::string &src_path, int verbose)
 		return nullptr;
 	}
 
-	auto proc = std::make_unique<PendingProc>(
+	auto proc = std::make_unique<PendingFile>(
 	    curlm, curl, src_path, static_cast<size_t>(src_size), verbose);
 
-	/* Link the new PendingProc instance to the curl handle. */
+	/* Link the new PendingFile instance to the curl handle. */
 	cc = curl_easy_setopt(curl, CURLOPT_PRIVATE, (void *)proc.get());
 	if (cc != CURLE_OK) {
 		std::cerr << "Failed to set CURLOPT_PRIVATE: "
@@ -404,7 +407,7 @@ PendingProc::Create(CURLM *curlm, const std::string &src_path, int verbose)
 		return nullptr;
 	}
 
-	/* Link the new PendingProc instance to our write callback. */
+	/* Link the new PendingFile instance to our write callback. */
 	cc = curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)proc.get());
 	if (cc != CURLE_OK) {
 		std::cerr << "Failed to set CURLOPT_WRITEDATA: "
@@ -415,7 +418,7 @@ PendingProc::Create(CURLM *curlm, const std::string &src_path, int verbose)
 	return proc;
 }
 
-PendingProc::~PendingProc()
+PendingFile::~PendingFile()
 {
 	if (curl != nullptr) {
 		CURLMcode cm;
@@ -432,11 +435,11 @@ PendingProc::~PendingProc()
 }
 
 size_t
-PendingProc::CurlWriteCallback(void *data, size_t size, size_t nmemb,
+PendingFile::CurlWriteCallback(void *data, size_t size, size_t nmemb,
 			       void *userp)
 {
 	size_t chunksz	  = size * nmemb;
-	PendingProc *proc = reinterpret_cast<PendingProc *>(userp);
+	PendingFile *proc = reinterpret_cast<PendingFile *>(userp);
 
 	assert(proc != nullptr);
 	proc->AppendResponse(data, chunksz);
@@ -445,7 +448,7 @@ PendingProc::CurlWriteCallback(void *data, size_t size, size_t nmemb,
 }
 
 void
-PendingProc::SetStatus(ProcStatus status)
+PendingFile::SetStatus(ProcStatus status)
 {
 	if (verbose >= 2) {
 		std::cout << logb(LogDbg) << src_path << ": "
@@ -456,14 +459,15 @@ PendingProc::SetStatus(ProcStatus status)
 }
 
 void
-PendingProc::AppendResponse(void *data, size_t size)
+PendingFile::AppendResponse(void *data, size_t size)
 {
 	postresp.write((const char *)data, size);
+	last_activity = std::chrono::system_clock::now();
 }
 
 /* Prepare a post request without performing it. */
 int
-PendingProc::PreparePost(const std::string &url, const json11::Json &jsreq)
+PendingFile::PreparePost(const std::string &url, const json11::Json &jsreq)
 {
 	CURLcode cc;
 
@@ -504,7 +508,8 @@ PendingProc::PreparePost(const std::string &url, const json11::Json &jsreq)
 		return -1;
 	}
 
-	curl_status = CurlStatus::Prepared;
+	curl_status   = CurlStatus::Prepared;
+	last_activity = std::chrono::system_clock::now();
 #if 0
 	cc = curl_easy_perform(curl);
 	if (cc != CURLE_OK) {
@@ -527,7 +532,7 @@ PendingProc::PreparePost(const std::string &url, const json11::Json &jsreq)
 }
 
 int
-PendingProc::CompletePost(json11::Json::object &jsresp)
+PendingFile::CompletePost(json11::Json::object &jsresp)
 {
 	std::string respstr;
 	std::string errs;
@@ -554,8 +559,9 @@ PendingProc::CompletePost(json11::Json::object &jsresp)
 	jsresp = js.object_items();
 
 	/* Reset CURL status to allow more requests. */
-	curl_status = CurlStatus::Idle;
-	postresp    = std::stringstream();
+	curl_status   = CurlStatus::Idle;
+	postresp      = std::stringstream();
+	last_activity = std::chrono::system_clock::now();
 
 	return 0;
 }
@@ -692,6 +698,8 @@ class VCoproc {
 		uint64_t bytes_nomdata	 = 0;
 		uint64_t files_failed	 = 0;
 		uint64_t bytes_failed	 = 0;
+		uint64_t files_timedout	 = 0;
+		uint64_t bytes_timedout	 = 0;
 		uint64_t files_completed = 0;
 		uint64_t bytes_completed = 0;
 	} stats;
@@ -704,12 +712,13 @@ class VCoproc {
 	static constexpr size_t MaxEntries = 5;
 
 	/* Map of in-progress proc entries. */
-	std::unordered_map<std::string, std::unique_ptr<PendingProc>> pending;
+	std::unordered_map<std::string, std::unique_ptr<PendingFile>> pending;
 
 	int FetchMoreFiles();
 	int FetchFilesFromDir(const std::string &dir,
 			      std::deque<std::string> &frontier, int &credits);
 	int CleanupCompleted();
+	int TimeoutWaiting();
 	int UpdateStatistics();
 	int WaitForBackend();
 
@@ -820,6 +829,8 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		    << "bytes_nomdata UNSIGNED INTEGER NOT NULL, "
 		    << "files_failed UNSIGNED INTEGER NOT NULL, "
 		    << "bytes_failed UNSIGNED INTEGER NOT NULL, "
+		    << "files_timedout UNSIGNED INTEGER NOT NULL, "
+		    << "bytes_timedout UNSIGNED INTEGER NOT NULL, "
 		    << "files_completed UNSIGNED INTEGER NOT NULL, "
 		    << "bytes_completed UNSIGNED INTEGER NOT NULL"
 		    << ")";
@@ -870,7 +881,7 @@ VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
 VCoproc::~VCoproc()
 {
 	/*
-	 * PendingProc objects must be destroyed before calling
+	 * PendingFile objects must be destroyed before calling
 	 * curl_multi_cleanup(). Force destruction with clear().
 	 */
 	pending.clear();
@@ -1015,7 +1026,7 @@ VCoproc::FetchFilesFromDir(const std::string &dirname,
 
 		if (!pending.count(path)) {
 			pending[path] = std::move(
-			    PendingProc::Create(curlm, path, verbose));
+			    PendingFile::Create(curlm, path, verbose));
 			if (verbose) {
 				std::cout << logb(LogDbg) << "New file " << path
 					  << std::endl;
@@ -1046,8 +1057,36 @@ VCoproc::CleanupCompleted()
 					  << proc->FilePath() << std::endl;
 			}
 			it = pending.erase(it);
+		} else if (proc->Status() == ProcStatus::Waiting &&
+			   proc->InactivitySeconds() > 1) {
+			if (verbose) {
+				std::cout << logb(LogDbg) << "Timed out "
+					  << proc->FilePath() << std::endl;
+			}
+			it = pending.erase(it);
 		} else {
 			++it;
+		}
+	}
+
+	return 0;
+}
+
+int
+VCoproc::TimeoutWaiting()
+{
+	for (auto &kv : pending) {
+		auto &proc = kv.second;
+
+		if (proc->Status() == ProcStatus::Waiting &&
+		    proc->InactivitySeconds() > 1) {
+			proc->SetStatus(ProcStatus::ProcFailure);
+			std::cerr << logb(LogErr) << "File " << proc->FilePath()
+				  << " timed out" << std::endl;
+			stats.files_failed++;
+			stats.bytes_failed += proc->FileSize();
+			stats.files_timedout++;
+			stats.bytes_timedout += proc->FileSize();
 		}
 	}
 
@@ -1065,11 +1104,13 @@ VCoproc::UpdateStatistics()
 
 	qss << "INSERT INTO stats(timestamp, files_scored, "
 	       "bytes_scored, files_nomdata, bytes_nomdata, "
-	       "files_failed, bytes_failed, files_completed, "
+	       "files_failed, bytes_failed, files_timedout, bytes_timedout, "
+	       "files_completed, "
 	       "bytes_completed) VALUES(strftime('%s','now'), "
 	    << stats.files_scored << "," << stats.bytes_scored << ","
 	    << stats.files_nomdata << "," << stats.bytes_nomdata << ","
 	    << stats.files_failed << "," << stats.bytes_failed << ","
+	    << stats.files_timedout << "," << stats.bytes_timedout << ","
 	    << stats.files_completed << "," << stats.bytes_completed << ")";
 	if (dbconn->ModifyStmt(qss, verbose)) {
 		return -1;
@@ -1198,7 +1239,7 @@ VCoproc::MainLoop()
 		CURLMsg *msg;
 		while ((msg = curl_multi_info_read(curlm, &msgs_left)) !=
 		       nullptr) {
-			PendingProc *p;
+			PendingFile *p;
 			long http_code;
 			CURLcode cc;
 
@@ -1299,7 +1340,11 @@ VCoproc::MainLoop()
 			 */
 			int ret;
 
-			// TODO maybe clear only the ones in Waiting state
+			/*
+			 * We could clear only the ones in waiting state,
+			 * but we won't bother because it's harmless to
+			 * reprocess already processed files.
+			 */
 			pending.clear();
 
 			std::cout << "Backend went offline. Waiting ..."
@@ -1377,6 +1422,15 @@ VCoproc::MainLoop()
 			stats.bytes_completed += proc->FileSize();
 
 			proc->SetStatus(ProcStatus::Complete);
+		}
+
+		/*
+		 * Mark timed out entries as failed. They will be
+		 * removed during the next step.
+		 */
+		err = TimeoutWaiting();
+		if (err) {
+			break;
 		}
 
 		/*
