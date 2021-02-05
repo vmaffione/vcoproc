@@ -326,11 +326,16 @@ class PendingFile {
 	std::string src_path; /* file path */
 	size_t src_size = 0;  /* file size in bytes */
 	int verbose	= 0;
-	std::string postdata;
+
+	/* Temporary storage for the current CURL request body. */
+	std::string postreq;
+
+	/* Temporary storage accumulator for the current CURL response body. */
 	std::stringstream postresp;
 
 	/* Time of last interaction with the backend. */
 	std::chrono::time_point<std::chrono::system_clock> last_activity;
+
 	/* Time of processing start. */
 	std::chrono::time_point<std::chrono::system_clock> proc_start;
 
@@ -341,6 +346,12 @@ class PendingFile {
 	CurlState curl_state = CurlState::Idle;
 
     public:
+	/* Temporary storage for external JSON metadata for this file. */
+	json11::Json jmdata;
+
+	/* Accumulator for the JSON output associated to this file. */
+	json11::Json::object jout;
+
 	PendingFile(CURLM *curlm, CURL *curl, const std::string &src_path,
 		    size_t src_size, int verbose)
 	    : curlm(curlm),
@@ -503,8 +514,8 @@ PendingFile::PreparePost(const std::string &url, const json11::Json &jsreq)
 	 * (by default), and therefore we must preserve it until the
 	 * end of the POST transfer.
 	 */
-	postdata = jsreq.dump();
-	cc	 = curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postdata.c_str());
+	postreq = jsreq.dump();
+	cc	= curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postreq.c_str());
 	if (cc != CURLE_OK) {
 		std::cerr << "Failed to set CURLOPT_POSTFIELDS: "
 			  << curl_easy_strerror(cc) << std::endl;
@@ -515,7 +526,7 @@ PendingFile::PreparePost(const std::string &url, const json11::Json &jsreq)
 	 * If we don't provide POSTFIELDSIZE, libcurl will strlen() by
 	 * itself.
 	 */
-	cc = curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, postdata.size());
+	cc = curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, postreq.size());
 	if (cc != CURLE_OK) {
 		std::cerr << "Failed to set CURLOPT_POSTFIELDSIZE: "
 			  << curl_easy_strerror(cc) << std::endl;
@@ -1297,9 +1308,42 @@ VCoproc::MainLoop()
 			if (pf->State() != PendState::New) {
 				continue;
 			}
-
 			new_files++;
 
+			/* Check if we have a JSON file containing metadata. */
+			std::vector<std::string> mdatapaths = {
+			    PathNameNewExt(pf->FilePath(), "json"),
+			    PathJoin(FileParentDir(pf->FilePath()),
+				     "metadata.json")};
+			for (const auto &mdatapath : mdatapaths) {
+				if (!IsFile(mdatapath)) {
+					continue;
+				}
+
+				std::ifstream fin(mdatapath);
+				if (!fin) {
+					std::cerr << "Failed to open "
+						  << mdatapath << std::endl;
+					continue;
+				}
+
+				std::string jstr(
+				    (std::istreambuf_iterator<char>(fin)),
+				    std::istreambuf_iterator<char>());
+				std::string errs;
+
+				json11::Json js =
+				    json11::Json::parse(jstr, errs);
+				if (!errs.empty() && js == json11::Json()) {
+					std::cerr << logb(LogErr)
+						  << "Metadata is not a JSON: "
+						  << jstr << std::endl;
+					continue;
+				}
+				pf->jmdata = js;
+			}
+
+			/* Make a POST request. */
 			json11::Json jsreq = json11::Json::object{
 			    {"file_name", pf->FilePath()},
 			};
@@ -1403,9 +1447,10 @@ VCoproc::MainLoop()
 				    FileBaseName(pf->FilePath());
 				std::string jspath;
 
-				jsresp["origin"] = source;
+				jsresp["origin"]   = source;
+				jsresp["metadata"] = pf->jmdata;
 
-				jsname = PathNameNoExt(jsname) + ".json";
+				jsname = PathNameNewExt(jsname, "json");
 				jspath = PathJoin(output_dir, jsname);
 				std::ofstream fout(jspath);
 				fout << json11::Json(jsresp).dump();

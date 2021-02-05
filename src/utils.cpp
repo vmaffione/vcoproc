@@ -217,6 +217,12 @@ PathNameNoExt(const std::string &path)
 	return path.substr(0, slashpos);
 }
 
+std::string
+PathNameNewExt(const std::string &path, std::string new_ext)
+{
+	return PathNameNoExt(path) + std::string(".") + new_ext;
+}
+
 static std::string
 CurtimeString()
 {
