@@ -205,6 +205,19 @@ FileHasExtension(const std::string &filename, const std::string &ext)
 	       filename.substr(filename.size() - ext.size()) == ext;
 }
 
+bool
+FileHasAnyExtension(const std::string &filename,
+		    const std::vector<std::string> &exts)
+{
+	for (const auto &ext : exts) {
+		if (FileHasExtension(filename, ext)) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
 std::string
 PathNameNoExt(const std::string &path)
 {

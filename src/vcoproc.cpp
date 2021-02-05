@@ -9,6 +9,7 @@
 #include <iostream>
 #include <memory>
 #include <poll.h>
+#include <regex>
 #include <signal.h>
 #include <sqlite3.h>
 #include <sstream>
@@ -37,6 +38,9 @@ Usage(const char *progname)
 	    << "    -v (increase verbosity level)" << std::endl
 	    << "    -s SOURCE_NAME (origin name)" << std::endl
 	    << "    -i INPUT_DIR (add directory to look for files)" << std::endl
+	    << "    -e INPUT_FILE_EXT (consider input files with this "
+	       "extension)"
+	    << std::endl
 	    << "    -o OUTPUT_DIR (directory where to store "
 	       "JSON processing output)"
 	    << std::endl
@@ -707,6 +711,7 @@ class VCoproc {
 	bool monitor = false;
 	std::string source;
 	std::vector<std::string> input_dirs;
+	std::vector<std::string> input_exts;
 	std::string output_dir;
 	std::string failed_dir;
 	std::string forward_dir;
@@ -762,13 +767,14 @@ class VCoproc {
 	static std::unique_ptr<VCoproc> Create(
 	    int stopfd, int verbose, bool consume, bool monitor,
 	    std::string source, std::vector<std::string> input_dirs,
-	    std::string output_dir, std::string failed_dir,
-	    std::string forward_dir, std::string dbfile, std::string host,
-	    unsigned short port);
+	    std::vector<std::string> input_exts, std::string output_dir,
+	    std::string failed_dir, std::string forward_dir, std::string dbfile,
+	    std::string host, unsigned short port);
 
 	VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend>, int verbose,
 		bool consume, bool monitor, std::string source,
-		std::vector<std::string> input_dirs, std::string output_dir,
+		std::vector<std::string> input_dirs,
+		std::vector<std::string> input_exts, std::string output_dir,
 		std::string failed_dir, std::string forward_dir,
 		std::string dbfile, std::unique_ptr<SQLiteDbConn> dbconn,
 		std::string host, unsigned short port);
@@ -779,9 +785,9 @@ class VCoproc {
 std::unique_ptr<VCoproc>
 VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		std::string source, std::vector<std::string> input_dirs,
-		std::string output_dir, std::string failed_dir,
-		std::string forward_dir, std::string dbfile, std::string host,
-		unsigned short port)
+		std::vector<std::string> input_exts, std::string output_dir,
+		std::string failed_dir, std::string forward_dir,
+		std::string dbfile, std::string host, unsigned short port)
 {
 	if (source.empty()) {
 		std::cerr << logb(LogErr) << "No source/origin specified"
@@ -793,6 +799,10 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		std::cerr << logb(LogErr) << "No input directories specified"
 			  << std::endl;
 		return nullptr;
+	}
+
+	if (input_exts.empty()) {
+		input_exts.push_back("wav");
 	}
 
 	if (output_dir.empty()) {
@@ -888,14 +898,16 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 
 	return std::make_unique<VCoproc>(
 	    stopfd, curlm, std::move(be), verbose, consume, monitor,
-	    std::move(source), std::move(input_dirs), std::move(output_dir),
-	    std::move(failed_dir), std::move(forward_dir), std::move(dbfile),
-	    std::move(dbconn), std::move(host), port);
+	    std::move(source), std::move(input_dirs), std::move(input_exts),
+	    std::move(output_dir), std::move(failed_dir),
+	    std::move(forward_dir), std::move(dbfile), std::move(dbconn),
+	    std::move(host), port);
 }
 
 VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
 		 int verbose, bool consume, bool monitor, std::string source,
-		 std::vector<std::string> input_dirs, std::string output_dir,
+		 std::vector<std::string> input_dirs,
+		 std::vector<std::string> input_exts, std::string output_dir,
 		 std::string failed_dir, std::string forward_dir,
 		 std::string dbfile, std::unique_ptr<SQLiteDbConn> dbconn,
 		 std::string host, unsigned short port)
@@ -907,6 +919,7 @@ VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
       monitor(monitor),
       source(std::move(source)),
       input_dirs(std::move(input_dirs)),
+      input_exts(std::move(input_exts)),
       output_dir(std::move(output_dir)),
       failed_dir(std::move(failed_dir)),
       forward_dir(std::move(forward_dir)),
@@ -1051,7 +1064,7 @@ VCoproc::FetchFilesFromDir(const std::string &dirname,
 			continue;
 		}
 
-		if (!is_file) {
+		if (!is_file || !FileHasAnyExtension(path, input_exts)) {
 			continue;
 		}
 
@@ -1582,6 +1595,7 @@ int
 main(int argc, char **argv)
 {
 	std::vector<std::string> input_dirs;
+	std::vector<std::string> input_exts;
 	std::string output_dir;
 	std::string failed_dir;
 	std::string forward_dir;
@@ -1629,7 +1643,7 @@ main(int argc, char **argv)
 		return ret;
 	}
 
-	while ((opt = getopt(argc, argv, "hVvi:o:F:f:cmD:H:p:s:")) != -1) {
+	while ((opt = getopt(argc, argv, "hVvi:o:F:f:cmD:H:p:s:e:")) != -1) {
 		switch (opt) {
 		case 'h':
 			Usage(argv[0]);
@@ -1716,6 +1730,20 @@ main(int argc, char **argv)
 				return -1;
 			}
 			break;
+
+		case 'e': {
+			std::string ext = std::string(optarg);
+
+			if (!std::regex_match(ext,
+					      std::regex("[a-zA-Z0-9]+"))) {
+				std::cerr << logb(LogErr)
+					  << "Invalid extension " << ext
+					  << std::endl;
+				return -1;
+			}
+			input_exts.push_back(ext);
+			break;
+		}
 		}
 	}
 
@@ -1723,8 +1751,8 @@ main(int argc, char **argv)
 
 	auto vcoproc = VCoproc::Create(
 	    stopfd_global, verbose, consume, monitor, std::move(source),
-	    std::move(input_dirs), std::move(output_dir), std::move(failed_dir),
-	    std::move(forward_dir), dbfile, host, port);
+	    std::move(input_dirs), std::move(input_exts), std::move(output_dir),
+	    std::move(failed_dir), std::move(forward_dir), dbfile, host, port);
 	if (vcoproc == nullptr) {
 		return -1;
 	}

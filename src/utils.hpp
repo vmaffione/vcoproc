@@ -36,6 +36,8 @@ std::string FileBaseName(const std::string &path);
 std::string FileParentDir(const std::string &path);
 std::string AbsPath(const std::string &path);
 bool FileHasExtension(const std::string &filename, const std::string &ext);
+bool FileHasAnyExtension(const std::string &filename,
+			 const std::vector<std::string> &exts);
 std::string PathNameNoExt(const std::string &path);
 std::string PathNameNewExt(const std::string &path, std::string new_ext);
 std::string PathJoin(const std::string &dirpath, const std::string &name);
