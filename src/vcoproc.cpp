@@ -301,7 +301,7 @@ SQLiteDbConn::SelectStmt(const std::stringstream &ss, int verbose)
  *  - state machine for multiple requests
  */
 
-enum class ProcStatus {
+enum class PendState {
 	None	    = 0,
 	New	    = 1,
 	Waiting	    = 2,
@@ -315,7 +315,7 @@ enum class ProcStatus {
  */
 class PendingFile {
     public:
-	enum class CurlStatus {
+	enum class CurlState {
 		Idle	 = 0,
 		Prepared = 1,
 	};
@@ -323,15 +323,22 @@ class PendingFile {
     private:
 	CURLM *curlm = nullptr;
 	CURL *curl   = nullptr;
-	std::string src_path;
-	size_t src_size = 0;
+	std::string src_path; /* file path */
+	size_t src_size = 0;  /* file size in bytes */
 	int verbose	= 0;
 	std::string postdata;
-	std::chrono::time_point<std::chrono::system_clock> last_activity;
-
-	CurlStatus curl_status = CurlStatus::Idle;
-	ProcStatus proc_status = ProcStatus::New;
 	std::stringstream postresp;
+
+	/* Time of last interaction with the backend. */
+	std::chrono::time_point<std::chrono::system_clock> last_activity;
+	/* Time of processing start. */
+	std::chrono::time_point<std::chrono::system_clock> proc_start;
+
+	/* State of this pending file. */
+	PendState state = PendState::New;
+
+	/* State of the CURL easy handle associated to this file. */
+	CurlState curl_state = CurlState::Idle;
 
     public:
 	PendingFile(CURLM *curlm, CURL *curl, const std::string &src_path,
@@ -341,14 +348,15 @@ class PendingFile {
 	      src_path(src_path),
 	      src_size(src_size),
 	      verbose(verbose),
-	      last_activity(std::chrono::system_clock::now())
+	      last_activity(std::chrono::system_clock::now()),
+	      proc_start(std::chrono::system_clock::now())
 	{
 	}
 
 	~PendingFile();
 
-	ProcStatus Status() const { return proc_status; }
-	void SetStatus(ProcStatus status);
+	PendState State() const { return state; }
+	void SetState(PendState state);
 	std::string FilePath() const { return src_path; }
 	size_t FileSize() const { return src_size; }
 	static std::unique_ptr<PendingFile> Create(CURLM *curlm,
@@ -359,7 +367,8 @@ class PendingFile {
 	void AppendResponse(void *data, size_t size);
 	int PreparePost(const std::string &url, const json11::Json &jsreq);
 	int CompletePost(json11::Json::object &jsresp);
-	size_t InactivitySeconds() const { return SecsElapsed(last_activity); }
+	float InactivitySeconds() const { return SecsElapsed(last_activity); }
+	float AgeSeconds() const { return SecsElapsed(proc_start); }
 };
 
 std::unique_ptr<PendingFile>
@@ -453,14 +462,14 @@ PendingFile::CurlWriteCallback(void *data, size_t size, size_t nmemb,
 }
 
 void
-PendingFile::SetStatus(ProcStatus status)
+PendingFile::SetState(PendState next_state)
 {
 	if (verbose >= 2) {
 		std::cout << logb(LogDbg) << src_path << ": "
-			  << static_cast<int>(proc_status) << " -> "
-			  << static_cast<int>(status) << std::endl;
+			  << static_cast<int>(state) << " -> "
+			  << static_cast<int>(next_state) << std::endl;
 	}
-	proc_status = status;
+	state = next_state;
 }
 
 void
@@ -476,8 +485,8 @@ PendingFile::PreparePost(const std::string &url, const json11::Json &jsreq)
 {
 	CURLcode cc;
 
-	if (curl_status != CurlStatus::Idle) {
-		std::cerr << "CURL status (" << static_cast<int>(curl_status)
+	if (curl_state != CurlState::Idle) {
+		std::cerr << "CURL state (" << static_cast<int>(curl_state)
 			  << ") is not idle" << std::endl;
 		return -1;
 	}
@@ -513,7 +522,7 @@ PendingFile::PreparePost(const std::string &url, const json11::Json &jsreq)
 		return -1;
 	}
 
-	curl_status   = CurlStatus::Prepared;
+	curl_state    = CurlState::Prepared;
 	last_activity = std::chrono::system_clock::now();
 #if 0
 	cc = curl_easy_perform(curl);
@@ -542,10 +551,10 @@ PendingFile::CompletePost(json11::Json::object &jsresp)
 	std::string respstr;
 	std::string errs;
 
-	if (curl_status != CurlStatus::Prepared) {
+	if (curl_state != CurlState::Prepared) {
 		std::cerr << logb(LogErr)
 			  << "Cannot compete POST: Invalid state "
-			  << static_cast<int>(curl_status) << std::endl;
+			  << static_cast<int>(curl_state) << std::endl;
 		return -1;
 	}
 
@@ -563,8 +572,8 @@ PendingFile::CompletePost(json11::Json::object &jsresp)
 	}
 	jsresp = js.object_items();
 
-	/* Reset CURL status to allow more requests. */
-	curl_status   = CurlStatus::Idle;
+	/* Reset CURL state to allow more requests. */
+	curl_state    = CurlState::Idle;
 	postresp      = std::stringstream();
 	last_activity = std::chrono::system_clock::now();
 
@@ -703,19 +712,20 @@ class VCoproc {
 	bool bail_out = false;
 
 	struct {
-		uint64_t files_scored	  = 0;
-		uint64_t bytes_scored	  = 0;
-		uint64_t audiosec_scored  = 0;
-		uint64_t speechsec_scored = 0;
-		uint64_t files_nomdata	  = 0;
-		uint64_t bytes_nomdata	  = 0;
-		uint64_t audiosec_nomdata = 0;
-		uint64_t files_failed	  = 0;
-		uint64_t bytes_failed	  = 0;
-		uint64_t files_timedout	  = 0;
-		uint64_t bytes_timedout	  = 0;
-		uint64_t files_completed  = 0;
-		uint64_t bytes_completed  = 0;
+		uint64_t files_scored	 = 0;
+		uint64_t bytes_scored	 = 0;
+		double audiosec_scored	 = 0;
+		double speechsec_scored	 = 0;
+		uint64_t files_nomdata	 = 0;
+		uint64_t bytes_nomdata	 = 0;
+		double audiosec_nomdata	 = 0;
+		uint64_t files_failed	 = 0;
+		uint64_t bytes_failed	 = 0;
+		uint64_t files_timedout	 = 0;
+		uint64_t bytes_timedout	 = 0;
+		uint64_t files_completed = 0;
+		uint64_t bytes_completed = 0;
+		double procsec_completed = 0;
 	} stats;
 	std::chrono::time_point<std::chrono::system_clock> stats_start;
 
@@ -828,7 +838,7 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		std::stringstream qss;
 		qss << "CREATE TABLE IF NOT EXISTS proc ("
 		    << "src_path VARCHAR(255) PRIMARY KEY NOT NULL, "
-		    << "status TINYINT NOT NULL, "
+		    << "state TINYINT NOT NULL, "
 		    << "mjson TEXT)";
 		if (dbconn->ModifyStmt(qss, verbose)) {
 			return nullptr;
@@ -840,17 +850,18 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		    << "timestamp UNSIGNED INTEGER PRIMARY KEY NOT NULL, "
 		    << "files_scored UNSIGNED INTEGER NOT NULL, "
 		    << "bytes_scored UNSIGNED INTEGER NOT NULL, "
-		    << "audiosec_scored UNSIGNED INTEGER NOT NULL, "
-		    << "speechsec_scored UNSIGNED INTEGER NOT NULL, "
+		    << "audiosec_scored DOUBLE NOT NULL, "
+		    << "speechsec_scored DOUBLE NOT NULL, "
 		    << "files_nomdata UNSIGNED INTEGER NOT NULL, "
 		    << "bytes_nomdata UNSIGNED INTEGER NOT NULL, "
-		    << "audiosec_nomdata UNSIGNED INTEGER NOT NULL, "
+		    << "audiosec_nomdata DOUBLE NOT NULL, "
 		    << "files_failed UNSIGNED INTEGER NOT NULL, "
 		    << "bytes_failed UNSIGNED INTEGER NOT NULL, "
 		    << "files_timedout UNSIGNED INTEGER NOT NULL, "
 		    << "bytes_timedout UNSIGNED INTEGER NOT NULL, "
 		    << "files_completed UNSIGNED INTEGER NOT NULL, "
-		    << "bytes_completed UNSIGNED INTEGER NOT NULL"
+		    << "bytes_completed UNSIGNED INTEGER NOT NULL,"
+		    << "procsec_completed DOUBLE NOT NULL"
 		    << ")";
 		if (dbconn->ModifyStmt(qss, verbose)) {
 			return nullptr;
@@ -1074,16 +1085,9 @@ VCoproc::CleanupCompleted()
 		 * table if we are not consuming the files,
 		 * otherwise we would reprocess it.
 		 */
-		if (pf->Status() == ProcStatus::Complete && consume) {
+		if (pf->State() == PendState::Complete && consume) {
 			if (verbose) {
 				std::cout << logb(LogDbg) << "Completed "
-					  << pf->FilePath() << std::endl;
-			}
-			it = pending.erase(it);
-		} else if (pf->Status() == ProcStatus::Waiting &&
-			   pf->InactivitySeconds() > 1) {
-			if (verbose) {
-				std::cout << logb(LogDbg) << "Timed out "
 					  << pf->FilePath() << std::endl;
 			}
 			it = pending.erase(it);
@@ -1105,8 +1109,8 @@ VCoproc::PostProcess()
 		auto &pf = kv.second;
 		std::string dstdir;
 
-		success = pf->Status() == ProcStatus::ProcSuccess;
-		failure = pf->Status() == ProcStatus::ProcFailure;
+		success = pf->State() == PendState::ProcSuccess;
+		failure = pf->State() == PendState::ProcFailure;
 
 		if (!(success || failure)) {
 			continue;
@@ -1149,8 +1153,9 @@ VCoproc::PostProcess()
 
 		stats.files_completed++;
 		stats.bytes_completed += pf->FileSize();
+		stats.procsec_completed += pf->AgeSeconds();
 
-		pf->SetStatus(ProcStatus::Complete);
+		pf->SetState(PendState::Complete);
 	}
 }
 
@@ -1160,9 +1165,9 @@ VCoproc::TimeoutWaiting()
 	for (auto &kv : pending) {
 		auto &pf = kv.second;
 
-		if (pf->Status() == ProcStatus::Waiting &&
-		    pf->InactivitySeconds() > 1) {
-			pf->SetStatus(ProcStatus::ProcFailure);
+		if (pf->State() == PendState::Waiting &&
+		    pf->InactivitySeconds() > 1.0) {
+			pf->SetState(PendState::ProcFailure);
 			std::cerr << logb(LogErr) << "File " << pf->FilePath()
 				  << " timed out" << std::endl;
 			stats.files_failed++;
@@ -1188,15 +1193,15 @@ VCoproc::UpdateStatistics(bool force = false)
 	       "bytes_scored, audiosec_scored, speechsec_scored, "
 	       "files_nomdata, bytes_nomdata, audiosec_nomdata, "
 	       "files_failed, bytes_failed, files_timedout, bytes_timedout, "
-	       "files_completed, "
-	       "bytes_completed) VALUES(strftime('%s','now'), "
+	       "files_completed, bytes_completed, "
+	       "procsec_completed) VALUES(strftime('%s','now'), "
 	    << stats.files_scored << "," << stats.bytes_scored << ","
 	    << stats.audiosec_scored << "," << stats.speechsec_scored << ","
 	    << stats.files_nomdata << "," << stats.bytes_nomdata << ","
 	    << stats.audiosec_nomdata << "," << stats.files_failed << ","
 	    << stats.bytes_failed << "," << stats.files_timedout << ","
 	    << stats.bytes_timedout << "," << stats.files_completed << ","
-	    << stats.bytes_completed << ")";
+	    << stats.bytes_completed << "," << stats.procsec_completed << ")";
 	if (dbconn->ModifyStmt(qss, verbose)) {
 		return -1;
 	}
@@ -1289,7 +1294,7 @@ VCoproc::MainLoop()
 		for (auto &kv : pending) {
 			auto &pf = kv.second;
 
-			if (pf->Status() != ProcStatus::New) {
+			if (pf->State() != PendState::New) {
 				continue;
 			}
 
@@ -1302,7 +1307,7 @@ VCoproc::MainLoop()
 					    jsreq)) {
 				continue;
 			}
-			pf->SetStatus(ProcStatus::Waiting);
+			pf->SetState(PendState::Waiting);
 		}
 
 		/* Advance any pending POST transfers. */
@@ -1408,11 +1413,11 @@ VCoproc::MainLoop()
 			}
 
 			if (!success) {
-				pf->SetStatus(ProcStatus::ProcFailure);
+				pf->SetState(PendState::ProcFailure);
 				stats.files_failed++;
 				stats.bytes_failed += pf->FileSize();
 			} else {
-				pf->SetStatus(ProcStatus::ProcSuccess);
+				pf->SetState(PendState::ProcSuccess);
 				if (jsresp["status"] == "COMPLETE") {
 					stats.files_scored++;
 					stats.bytes_scored += pf->FileSize();
