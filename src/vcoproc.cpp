@@ -736,7 +736,7 @@ class VCoproc {
 	int CleanupCompleted();
 	void PostProcess();
 	int TimeoutWaiting();
-	int UpdateStatistics();
+	int UpdateStatistics(bool force);
 	int WaitForBackend();
 
     public:
@@ -1173,17 +1173,17 @@ VCoproc::TimeoutWaiting()
 }
 
 int
-VCoproc::UpdateStatistics()
+VCoproc::UpdateStatistics(bool force = false)
 {
 	std::stringstream qss;
 
-	if (SecsElapsed(stats_start) < 2) {
+	if (!force && SecsElapsed(stats_start) < 2) {
 		return 0;
 	}
 
 	qss << "INSERT INTO stats(timestamp, files_scored, "
 	       "bytes_scored, audiosec_scored, speechsec_scored, "
-	       "files_nomdata, bytes_nomdata, "
+	       "files_nomdata, bytes_nomdata, audiosec_nomdata, "
 	       "files_failed, bytes_failed, files_timedout, bytes_timedout, "
 	       "files_completed, "
 	       "bytes_completed) VALUES(strftime('%s','now'), "
@@ -1482,7 +1482,7 @@ VCoproc::MainLoop()
 			break;
 		}
 
-		/* Update the statistics. */
+		/* Update the statistics if necessary. */
 		UpdateStatistics();
 
 		/*
@@ -1519,6 +1519,8 @@ VCoproc::MainLoop()
 			break;
 		}
 	}
+
+	UpdateStatistics(/*force=*/true);
 
 	return err;
 }
