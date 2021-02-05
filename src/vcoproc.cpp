@@ -691,6 +691,12 @@ class VCoproc {
 	unsigned short port  = 0;
 	size_t input_dir_idx = 0;
 
+	/*
+	 * Set by any routine in the MainLoop on unrecoverable
+	 * errors. The MainLoop will stop ASAP.
+	 */
+	bool bail_out = false;
+
 	struct {
 		uint64_t files_scored	 = 0;
 		uint64_t bytes_scored	 = 0;
@@ -718,6 +724,7 @@ class VCoproc {
 	int FetchFilesFromDir(const std::string &dir,
 			      std::deque<std::string> &frontier, int &credits);
 	int CleanupCompleted();
+	void PostProcess();
 	int TimeoutWaiting();
 	int UpdateStatistics();
 	int WaitForBackend();
@@ -1072,6 +1079,65 @@ VCoproc::CleanupCompleted()
 	return 0;
 }
 
+void
+VCoproc::PostProcess()
+{
+	bool forward = !forward_dir.empty();
+
+	for (auto &kv : pending) {
+		bool remove, copy, move, copymove, success, failure;
+		auto &pf = kv.second;
+		std::string dstdir;
+
+		success = pf->Status() == ProcStatus::ProcSuccess;
+		failure = pf->Status() == ProcStatus::ProcFailure;
+
+		if (!(success || failure)) {
+			continue;
+		}
+
+		remove	 = success && consume && !forward;
+		copymove = failure || (success && forward);
+		copy	 = copymove && !consume;
+		move	 = copymove && consume;
+		dstdir	 = failure ? failed_dir : forward_dir;
+
+		if (remove) {
+			if (RemoveFile(pf->FilePath())) {
+				bail_out = true;
+			} else if (verbose) {
+				std::cout << logb(LogDbg) << "Removed "
+					  << pf->FilePath() << std::endl;
+			}
+
+		} else if (move) {
+			if (MoveToDir(dstdir, pf->FilePath())) {
+				bail_out = true;
+			} else if (verbose) {
+				std::cout << logb(LogDbg) << "Moved "
+					  << pf->FilePath() << " --> " << dstdir
+					  << std::endl;
+			}
+
+		} else if (copy) {
+			if (CopyToDir(dstdir, pf->FilePath())) {
+				bail_out = true;
+			} else if (verbose) {
+				std::cout << logb(LogDbg) << "Copied "
+					  << pf->FilePath() << " --> " << dstdir
+					  << std::endl;
+			}
+		} else {
+			/* success && !consume && !forward */
+		}
+
+		stats.files_completed++;
+		stats.bytes_completed += pf->FileSize();
+
+		pf->SetStatus(ProcStatus::Complete);
+	}
+}
+
 int
 VCoproc::TimeoutWaiting()
 {
@@ -1179,12 +1245,6 @@ VCoproc::WaitForBackend()
 int
 VCoproc::MainLoop()
 {
-	bool forward = !forward_dir.empty();
-	/*
-	 * The loop below will set bail_out to true when we get and error
-	 * from which we cannot recover.
-	 */
-	bool bail_out	      = false;
 	int num_running_curls = 0;
 	int timeout_ms	      = 5000;
 	std::string base_url;
@@ -1370,59 +1430,7 @@ VCoproc::MainLoop()
 		/*
 		 * Post process any entries in ProcSuccess or ProcFailure state.
 		 */
-		for (auto &kv : pending) {
-			bool remove, copy, move, copymove, success, failure;
-			auto &pf = kv.second;
-			std::string dstdir;
-
-			success = pf->Status() == ProcStatus::ProcSuccess;
-			failure = pf->Status() == ProcStatus::ProcFailure;
-
-			if (!(success || failure)) {
-				continue;
-			}
-
-			remove	 = success && consume && !forward;
-			copymove = failure || (success && forward);
-			copy	 = copymove && !consume;
-			move	 = copymove && consume;
-			dstdir	 = failure ? failed_dir : forward_dir;
-
-			if (remove) {
-				if (RemoveFile(pf->FilePath())) {
-					bail_out = true;
-				} else if (verbose) {
-					std::cout << logb(LogDbg) << "Removed "
-						  << pf->FilePath()
-						  << std::endl;
-				}
-
-			} else if (move) {
-				if (MoveToDir(dstdir, pf->FilePath())) {
-					bail_out = true;
-				} else if (verbose) {
-					std::cout << logb(LogDbg) << "Moved "
-						  << pf->FilePath() << " --> "
-						  << dstdir << std::endl;
-				}
-
-			} else if (copy) {
-				if (CopyToDir(dstdir, pf->FilePath())) {
-					bail_out = true;
-				} else if (verbose) {
-					std::cout << logb(LogDbg) << "Copied "
-						  << pf->FilePath() << " --> "
-						  << dstdir << std::endl;
-				}
-			} else {
-				/* success && !consume && !forward */
-			}
-
-			stats.files_completed++;
-			stats.bytes_completed += pf->FileSize();
-
-			pf->SetStatus(ProcStatus::Complete);
-		}
+		PostProcess();
 
 		/*
 		 * Mark timed out entries as failed. They will be
