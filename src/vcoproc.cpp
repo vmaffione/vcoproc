@@ -304,6 +304,21 @@ SQLiteDbConn::SelectStmt(const std::stringstream &ss, int verbose)
  *  - state machine for multiple requests
  */
 
+class BackendTransaction {
+    public:
+	virtual int PrepareRequest(std::string &url, json11::Json &jsreq) = 0;
+	virtual int ProcessResponse(json11::Json &jsresp,
+				    json11::Json::object &jout)		  = 0;
+};
+
+class Backend {
+    public:
+	virtual bool Probe()		    = 0;
+	virtual std::string BaseUrl() const = 0;
+	virtual std::unique_ptr<BackendTransaction> CreateTransaction(
+	    const std::string &filepath) = 0;
+};
+
 enum class PendState {
 	None	    = 0,
 	New	    = 1,
@@ -322,6 +337,8 @@ class PendingFile {
 		Idle	 = 0,
 		Prepared = 1,
 	};
+
+	std::unique_ptr<BackendTransaction> bt;
 
     private:
 	CURLM *curlm = nullptr;
@@ -356,9 +373,11 @@ class PendingFile {
 	/* Accumulator for the JSON output associated to this file. */
 	json11::Json::object jout;
 
-	PendingFile(CURLM *curlm, CURL *curl, const std::string &src_path,
-		    size_t src_size, int verbose)
-	    : curlm(curlm),
+	PendingFile(std::unique_ptr<BackendTransaction> bt, CURLM *curlm,
+		    CURL *curl, const std::string &src_path, size_t src_size,
+		    int verbose)
+	    : bt(std::move(bt)),
+	      curlm(curlm),
 	      curl(curl),
 	      src_path(src_path),
 	      src_size(src_size),
@@ -374,27 +393,28 @@ class PendingFile {
 	void SetState(PendState state);
 	std::string FilePath() const { return src_path; }
 	size_t FileSize() const { return src_size; }
-	static std::unique_ptr<PendingFile> Create(CURLM *curlm,
-						   const std::string &src_path,
-						   int verbose);
+	static std::unique_ptr<PendingFile> Create(
+	    std::unique_ptr<BackendTransaction> bt, CURLM *curlm,
+	    const std::string &src_path, int verbose);
 	int LoadMetadata(const std::string &mdatapath);
 	json11::Json GetMetadata() const;
 	static size_t CurlWriteCallback(void *data, size_t size, size_t nmemb,
 					void *userp);
 	void AppendResponse(void *data, size_t size);
 	int PreparePost(const std::string &url, const json11::Json &jsreq);
-	int CompletePost(json11::Json::object &jsresp);
+	int CompletePost(json11::Json &jsresp);
 	float InactivitySeconds() const { return SecsElapsed(last_activity); }
 	float AgeSeconds() const { return SecsElapsed(proc_start); }
 };
 
 std::unique_ptr<PendingFile>
-PendingFile::Create(CURLM *curlm, const std::string &src_path, int verbose)
+PendingFile::Create(std::unique_ptr<BackendTransaction> bt, CURLM *curlm,
+		    const std::string &src_path, int verbose)
 {
 	CURLcode cc;
 	CURL *curl;
 
-	if (curlm == nullptr) {
+	if (curlm == nullptr || bt == nullptr) {
 		return nullptr;
 	}
 
@@ -428,7 +448,8 @@ PendingFile::Create(CURLM *curlm, const std::string &src_path, int verbose)
 	}
 
 	auto pf = std::make_unique<PendingFile>(
-	    curlm, curl, src_path, static_cast<size_t>(src_size), verbose);
+	    std::move(bt), curlm, curl, src_path, static_cast<size_t>(src_size),
+	    verbose);
 
 	/* Link the new PendingFile instance to the curl handle. */
 	cc = curl_easy_setopt(curl, CURLOPT_PRIVATE, (void *)pf.get());
@@ -576,29 +597,12 @@ PendingFile::PreparePost(const std::string &url, const json11::Json &jsreq)
 
 	curl_state    = CurlState::Prepared;
 	last_activity = std::chrono::system_clock::now();
-#if 0
-	cc = curl_easy_perform(curl);
-	if (cc != CURLE_OK) {
-		std::cerr << "Failed to perform request: "
-			  << curl_easy_strerror(cc) << std::endl;
-		return -1;
-	} else {
-		long code = 0;
-		cc = curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
-		if (cc != CURLE_OK) {
-			std::cerr << "Failed to get CURLINFO_RESPONSE_CODE: "
-				<< curl_easy_strerror(cc) << std::endl;
-			return -1;
-		}
-		std::cout << "REQUEST DONE: " << code << std::endl;
-	}
-#endif
 
 	return 0;
 }
 
 int
-PendingFile::CompletePost(json11::Json::object &jsresp)
+PendingFile::CompletePost(json11::Json &jsresp)
 {
 	std::string respstr;
 	std::string errs;
@@ -616,13 +620,12 @@ PendingFile::CompletePost(json11::Json::object &jsresp)
 		return -1;
 	}
 
-	json11::Json js = json11::Json::parse(respstr, errs);
-	if (!errs.empty() && js == json11::Json()) {
+	jsresp = json11::Json::parse(respstr, errs);
+	if (!errs.empty() && jsresp == json11::Json()) {
 		std::cerr << logb(LogErr)
 			  << "Response is not a JSON: " << respstr << std::endl;
 		return -1;
 	}
-	jsresp = js.object_items();
 
 	/* Reset CURL state to allow more requests. */
 	curl_state    = CurlState::Idle;
@@ -632,11 +635,73 @@ PendingFile::CompletePost(json11::Json::object &jsresp)
 	return 0;
 }
 
-class Backend {
+class PsBackendTransaction : public BackendTransaction {
+	Backend *be = nullptr;
+	std::string filepath;
+	enum class State {
+		Init	       = 0,
+		WaitForProcess = 1,
+		Finished       = 2,
+	};
+	State state = State::Init;
+
     public:
-	virtual bool Probe()		    = 0;
-	virtual std::string BaseUrl() const = 0;
+	PsBackendTransaction(Backend *be, const std::string &filepath)
+	    : be(be), filepath(filepath)
+	{
+	}
+	int PrepareRequest(std::string &url, json11::Json &jsreq);
+	int ProcessResponse(json11::Json &jsresp, json11::Json::object &jout);
 };
+
+int
+PsBackendTransaction::PrepareRequest(std::string &url, json11::Json &jsreq)
+{
+	switch (state) {
+	case State::Init: {
+		url   = be->BaseUrl() + "/process";
+		jsreq = json11::Json::object{
+		    {"file_name", filepath},
+		};
+		state = State::WaitForProcess;
+		break;
+	}
+
+	case State::Finished:
+		return 1;
+		break;
+
+	default:
+		std::cerr << "PrepareRequest() called in illegal state "
+			  << static_cast<int>(state) << std::endl;
+		return -1;
+		break;
+	}
+
+	return 0;
+}
+
+int
+PsBackendTransaction::ProcessResponse(json11::Json &jsresp,
+				      json11::Json::object &jout)
+{
+	jout = jsresp.object_items();
+	switch (state) {
+	case State::WaitForProcess:
+		jout  = jsresp.object_items();
+		state = State::Finished;
+		return 1;
+		break;
+
+	default:
+		std::cerr << "ProcessResponse() called in illegal state "
+			  << static_cast<int>(state) << std::endl;
+		return -1;
+		break;
+	}
+
+	return 0;
+}
 
 class PsBackend : public Backend {
 	std::string base_url;
@@ -646,8 +711,9 @@ class PsBackend : public Backend {
 					       unsigned short port);
 	PsBackend(std::string base_url);
 	virtual bool Probe();
-
 	std::string BaseUrl() const { return base_url; }
+	std::unique_ptr<BackendTransaction> CreateTransaction(
+	    const std::string &filepath);
 };
 
 std::unique_ptr<Backend>
@@ -736,6 +802,12 @@ end:
 	curl_easy_cleanup(curl);
 
 	return http_code == 200;
+}
+
+std::unique_ptr<BackendTransaction>
+PsBackend::CreateTransaction(const std::string &filepath)
+{
+	return std::make_unique<PsBackendTransaction>(this, filepath);
 }
 
 /* Main class. */
@@ -1120,8 +1192,9 @@ VCoproc::FetchFilesFromDir(const std::string &dirname,
 		}
 
 		if (!pending.count(path)) {
-			pending[path] = std::move(
-			    PendingFile::Create(curlm, path, verbose));
+			pending[path] = std::move(PendingFile::Create(
+			    std::move(be->CreateTransaction(path)), curlm, path,
+			    verbose));
 			if (verbose) {
 				std::cout << logb(LogDbg) << "New file " << path
 					  << std::endl;
@@ -1372,12 +1445,15 @@ VCoproc::MainLoop()
 				}
 			}
 
-			/* Make a POST request. */
-			json11::Json jsreq = json11::Json::object{
-			    {"file_name", pf->FilePath()},
-			};
-			if (pf->PreparePost(be->BaseUrl() + "/process",
-					    jsreq)) {
+			json11::Json jsreq;
+			std::string url;
+
+			/* Get the URL and content for the next POST. */
+			if (pf->bt->PrepareRequest(url, jsreq) < 0) {
+				continue;
+			}
+			/* Setup the POST request with CURL. */
+			if (pf->PreparePost(url, jsreq)) {
 				continue;
 			}
 			pf->SetState(PendState::Waiting);
@@ -1434,40 +1510,49 @@ VCoproc::MainLoop()
 				break;
 			}
 
-			bool success	  = (http_code == 200);
-			double audio_len  = 0;
-			double speech_len = 0;
-			json11::Json::object jsresp;
+			bool success = (http_code == 200);
+			json11::Json jsresp;
 
 			if (pf->CompletePost(jsresp)) {
 				success = false;
+			} else {
+				int r =
+				    pf->bt->ProcessResponse(jsresp, pf->jout);
+				if (r == 0) {
+					/* The transaction is not complete. */
+					continue;
+				}
+				success = r > 0;
 			}
+
+			double audio_len  = 0;
+			double speech_len = 0;
 
 			if (verbose) {
 				std::cout << logb(LogDbg) << "Processed "
 					  << pf->FilePath() << " --> "
 					  << http_code << " "
-					  << json11::Json(jsresp).dump()
+					  << json11::Json(pf->jout).dump()
 					  << std::endl;
 			}
 
-			if (!jsresp.count("status")) {
+			if (!pf->jout.count("status")) {
 				std::cerr << logb(LogErr)
 					  << "Missing status key" << std::endl;
 				success = false;
 			} else {
-				success = (jsresp["status"] == "COMPLETE") ||
-					  (jsresp["status"] == "NOMETADATA");
+				success = (pf->jout["status"] == "COMPLETE") ||
+					  (pf->jout["status"] == "NOMETADATA");
 			}
 
-			if (jsresp.count("length") &&
-			    jsresp["length"].is_number()) {
-				audio_len = jsresp["length"].number_value();
+			if (pf->jout.count("length") &&
+			    pf->jout["length"].is_number()) {
+				audio_len = pf->jout["length"].number_value();
 			}
-			if (jsresp.count("net_speech") &&
-			    jsresp["net_speech"].is_number()) {
+			if (pf->jout.count("net_speech") &&
+			    pf->jout["net_speech"].is_number()) {
 				speech_len =
-				    jsresp["net_speech"].number_value();
+				    pf->jout["net_speech"].number_value();
 			}
 
 			if (success) {
@@ -1476,17 +1561,17 @@ VCoproc::MainLoop()
 				    FileBaseName(pf->FilePath());
 				std::string jspath;
 
-				jsresp["origin"] = source;
+				pf->jout["origin"] = source;
 
 				json11::Json jmdata = pf->GetMetadata();
 				if (jmdata != json11::Json()) {
-					jsresp["metadata"] = jmdata;
+					pf->jout["metadata"] = jmdata;
 				}
 
 				jsname = PathNameNewExt(jsname, "json");
 				jspath = PathJoin(output_dir, jsname);
 				std::ofstream fout(jspath);
-				fout << json11::Json(jsresp).dump();
+				fout << json11::Json(pf->jout).dump();
 				fout << std::endl;
 			}
 
@@ -1496,7 +1581,7 @@ VCoproc::MainLoop()
 				stats.bytes_failed += pf->FileSize();
 			} else {
 				pf->SetState(PendState::ProcSuccess);
-				if (jsresp["status"] == "COMPLETE") {
+				if (pf->jout["status"] == "COMPLETE") {
 					stats.files_scored++;
 					stats.bytes_scored += pf->FileSize();
 					stats.audiosec_scored += audio_len;
