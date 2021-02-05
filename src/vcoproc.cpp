@@ -320,12 +320,13 @@ class Backend {
 };
 
 enum class PendState {
-	None	    = 0,
-	New	    = 1,
-	Waiting	    = 2,
-	ProcSuccess = 3,
-	ProcFailure = 4,
-	Complete    = 5,
+	None		= 0,
+	New		= 1,
+	ReadyToSubmit	= 2,
+	WaitingResponse = 3,
+	ProcSuccess	= 4,
+	ProcFailure	= 5,
+	Complete	= 6,
 };
 
 /*
@@ -667,10 +668,6 @@ PsBackendTransaction::PrepareRequest(std::string &url, json11::Json &jsreq)
 		break;
 	}
 
-	case State::Finished:
-		return 1;
-		break;
-
 	default:
 		std::cerr << "PrepareRequest() called in illegal state "
 			  << static_cast<int>(state) << std::endl;
@@ -689,7 +686,7 @@ PsBackendTransaction::ProcessResponse(json11::Json &jsresp,
 	switch (state) {
 	case State::WaitForProcess:
 		jout  = jsresp.object_items();
-		state = State::Finished;
+		state = State::Finished; /* Transaction is now complete. */
 		return 1;
 		break;
 
@@ -1299,7 +1296,7 @@ VCoproc::TimeoutWaiting()
 	for (auto &kv : pending) {
 		auto &pf = kv.second;
 
-		if (pf->State() == PendState::Waiting &&
+		if (pf->State() == PendState::WaitingResponse &&
 		    pf->InactivitySeconds() > 1.0) {
 			pf->SetState(PendState::ProcFailure);
 			std::cerr << logb(LogErr) << "File " << pf->FilePath()
@@ -1420,10 +1417,7 @@ VCoproc::MainLoop()
 			break;
 		}
 
-		/*
-		 * Scan any new entries and prepare a POST request to
-		 * submit to the backend engine.
-		 */
+		/* Scan any new entries and carry out some pre-processing. */
 		int new_files = 0;
 		for (auto &kv : pending) {
 			auto &pf = kv.second;
@@ -1444,19 +1438,35 @@ VCoproc::MainLoop()
 					break;
 				}
 			}
+			pf->SetState(PendState::ReadyToSubmit);
+		}
+
+		/*
+		 * Scan ReadyToSubmit entries, preparing the next POST request
+		 * to be submitted to the backend engine.
+		 */
+		for (auto &kv : pending) {
+			auto &pf = kv.second;
+
+			if (pf->State() != PendState::ReadyToSubmit) {
+				continue;
+			}
 
 			json11::Json jsreq;
 			std::string url;
 
 			/* Get the URL and content for the next POST. */
-			if (pf->bt->PrepareRequest(url, jsreq) < 0) {
+			int r = pf->bt->PrepareRequest(url, jsreq);
+			if (r) {
+				pf->SetState(PendState::ProcFailure);
 				continue;
 			}
 			/* Setup the POST request with CURL. */
 			if (pf->PreparePost(url, jsreq)) {
+				pf->SetState(PendState::ProcFailure);
 				continue;
 			}
-			pf->SetState(PendState::Waiting);
+			pf->SetState(PendState::WaitingResponse);
 		}
 
 		/* Advance any pending POST transfers. */
@@ -1520,6 +1530,7 @@ VCoproc::MainLoop()
 				    pf->bt->ProcessResponse(jsresp, pf->jout);
 				if (r == 0) {
 					/* The transaction is not complete. */
+					pf->SetState(PendState::ReadyToSubmit);
 					continue;
 				}
 				success = r > 0;
