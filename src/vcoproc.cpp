@@ -296,6 +296,13 @@ SQLiteDbConn::SelectStmt(const std::stringstream &ss, int verbose)
 	return std::make_unique<SQLiteDbCursor>(dbh, pstmt);
 }
 
+/* TODO
+ *  - remove input directories up to level N
+ *  - support mjson
+ *  - account for length (statistics)
+ *  - state machine for multiple requests
+ */
+
 enum class ProcStatus {
 	None	    = 0,
 	New	    = 1,
@@ -698,16 +705,19 @@ class VCoproc {
 	bool bail_out = false;
 
 	struct {
-		uint64_t files_scored	 = 0;
-		uint64_t bytes_scored	 = 0;
-		uint64_t files_nomdata	 = 0;
-		uint64_t bytes_nomdata	 = 0;
-		uint64_t files_failed	 = 0;
-		uint64_t bytes_failed	 = 0;
-		uint64_t files_timedout	 = 0;
-		uint64_t bytes_timedout	 = 0;
-		uint64_t files_completed = 0;
-		uint64_t bytes_completed = 0;
+		uint64_t files_scored	  = 0;
+		uint64_t bytes_scored	  = 0;
+		uint64_t audiosec_scored  = 0;
+		uint64_t speechsec_scored = 0;
+		uint64_t files_nomdata	  = 0;
+		uint64_t bytes_nomdata	  = 0;
+		uint64_t audiosec_nomdata = 0;
+		uint64_t files_failed	  = 0;
+		uint64_t bytes_failed	  = 0;
+		uint64_t files_timedout	  = 0;
+		uint64_t bytes_timedout	  = 0;
+		uint64_t files_completed  = 0;
+		uint64_t bytes_completed  = 0;
 	} stats;
 	std::chrono::time_point<std::chrono::system_clock> stats_start;
 
@@ -832,8 +842,11 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		    << "timestamp UNSIGNED INTEGER PRIMARY KEY NOT NULL, "
 		    << "files_scored UNSIGNED INTEGER NOT NULL, "
 		    << "bytes_scored UNSIGNED INTEGER NOT NULL, "
+		    << "audiosec_scored UNSIGNED INTEGER NOT NULL, "
+		    << "speechsec_scored UNSIGNED INTEGER NOT NULL, "
 		    << "files_nomdata UNSIGNED INTEGER NOT NULL, "
 		    << "bytes_nomdata UNSIGNED INTEGER NOT NULL, "
+		    << "audiosec_nomdata UNSIGNED INTEGER NOT NULL, "
 		    << "files_failed UNSIGNED INTEGER NOT NULL, "
 		    << "bytes_failed UNSIGNED INTEGER NOT NULL, "
 		    << "files_timedout UNSIGNED INTEGER NOT NULL, "
@@ -1169,15 +1182,18 @@ VCoproc::UpdateStatistics()
 	}
 
 	qss << "INSERT INTO stats(timestamp, files_scored, "
-	       "bytes_scored, files_nomdata, bytes_nomdata, "
+	       "bytes_scored, audiosec_scored, speechsec_scored, "
+	       "files_nomdata, bytes_nomdata, "
 	       "files_failed, bytes_failed, files_timedout, bytes_timedout, "
 	       "files_completed, "
 	       "bytes_completed) VALUES(strftime('%s','now'), "
 	    << stats.files_scored << "," << stats.bytes_scored << ","
+	    << stats.audiosec_scored << "," << stats.speechsec_scored << ","
 	    << stats.files_nomdata << "," << stats.bytes_nomdata << ","
-	    << stats.files_failed << "," << stats.bytes_failed << ","
-	    << stats.files_timedout << "," << stats.bytes_timedout << ","
-	    << stats.files_completed << "," << stats.bytes_completed << ")";
+	    << stats.audiosec_nomdata << "," << stats.files_failed << ","
+	    << stats.bytes_failed << "," << stats.files_timedout << ","
+	    << stats.bytes_timedout << "," << stats.files_completed << ","
+	    << stats.bytes_completed << ")";
 	if (dbconn->ModifyStmt(qss, verbose)) {
 		return -1;
 	}
@@ -1337,7 +1353,9 @@ VCoproc::MainLoop()
 				break;
 			}
 
-			bool success = (http_code == 200);
+			bool success	  = (http_code == 200);
+			double audio_len  = 0;
+			double speech_len = 0;
 			json11::Json::object jsresp;
 
 			if (pf->CompletePost(jsresp)) {
@@ -1359,6 +1377,16 @@ VCoproc::MainLoop()
 			} else {
 				success = (jsresp["status"] == "COMPLETE") ||
 					  (jsresp["status"] == "NOMETADATA");
+			}
+
+			if (jsresp.count("length") &&
+			    jsresp["length"].is_number()) {
+				audio_len = jsresp["length"].number_value();
+			}
+			if (jsresp.count("net_speech") &&
+			    jsresp["net_speech"].is_number()) {
+				speech_len =
+				    jsresp["net_speech"].number_value();
 			}
 
 			if (success) {
@@ -1385,9 +1413,12 @@ VCoproc::MainLoop()
 				if (jsresp["status"] == "COMPLETE") {
 					stats.files_scored++;
 					stats.bytes_scored += pf->FileSize();
+					stats.audiosec_scored += audio_len;
+					stats.speechsec_scored += speech_len;
 				} else {
 					stats.files_nomdata++;
 					stats.bytes_nomdata += pf->FileSize();
+					stats.audiosec_nomdata += audio_len;
 				}
 			}
 		}
@@ -1479,6 +1510,7 @@ VCoproc::MainLoop()
 		}
 
 		if (wfd[0].revents & CURL_WAIT_POLLIN) {
+			/* We got a signal asking us to stop. */
 			EventFdDrain(stopfd);
 			if (verbose) {
 				std::cout << "Stopping the event loop"

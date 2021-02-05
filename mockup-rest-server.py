@@ -110,9 +110,12 @@ class TestRequestHandler(myhttp.RequestHandler):
                     jsresp = {'status': 'ERROR', 'reason': 'You unlucky'}
                 else:
                     if random.uniform(0.0, 1.0) < 0.8:
-                        jsresp = {'status': 'COMPLETE'}
+                        jsresp = {'status': 'COMPLETE',
+                                'length': random.uniform(10.0, 367.3),
+                                'net_speech': random.uniform(4.1, 103.8)}
                     else:
-                        jsresp = {'status': 'NOMETADATA'}
+                        jsresp = {'status': 'NOMETADATA',
+                                    'length': random.uniform(2.1, 50.9)}
                 return self.return_json(jsresp)
 
 
