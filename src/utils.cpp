@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstring>
+#include <ctime>
 #include <dirent.h>
 #include <fcntl.h>
 #include <fstream>
@@ -124,6 +125,28 @@ FileSize(const char *path)
 	}
 
 	return static_cast<long long int>(st.st_size);
+}
+
+long long int
+FileAgeSeconds(const char *path)
+{
+	struct stat st;
+	int ret	   = stat(path, &st);
+	time_t now = time(nullptr);
+
+	if (ret) {
+		std::cerr << logb(LogErr) << "Failed to stat(" << path
+			  << "): " << strerror(errno) << std::endl;
+		return -1;
+	}
+
+	return static_cast<long long int>(now - st.st_mtime);
+}
+
+long long int
+FileAgeSeconds(const std::string &path)
+{
+	return FileAgeSeconds(path.c_str());
 }
 
 long long int

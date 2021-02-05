@@ -297,9 +297,7 @@ SQLiteDbConn::SelectStmt(const std::stringstream &ss, int verbose)
 }
 
 /* TODO
- *  - remove input directories up to level N
  *  - support mjson
- *  - account for length (statistics)
  *  - state machine for multiple requests
  */
 
@@ -997,10 +995,15 @@ VCoproc::FetchFilesFromDir(const std::string &dirname,
 		std::string path = PathJoin(dirname, dent->d_name);
 
 		if (is_dir) {
-			if (DirEmpty(path)) {
+			if (DirEmpty(path) && FileAgeSeconds(path) > 30) {
 				/*
-				 * If we find an empty directory, we remove it.
-				 * This will also help to do less BFS work.
+				 * If we find an empty directory that has not
+				 * been modified in a short while, we remove
+				 * it. The age check prevents situations where
+				 * we remove directories created by the input
+				 * producer before the producer has the chance
+				 * to move something inside.
+				 * The removal also helps to do less BFS work.
 				 */
 				if (rmdir(path.c_str())) {
 					std::cerr << logb(LogErr)

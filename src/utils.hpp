@@ -30,6 +30,8 @@ bool IsFile(const char *path);
 bool IsFile(const std::string &path);
 long long int FileSize(const char *path);
 long long int FileSize(const std::string &filename);
+long long int FileAgeSeconds(const char *path);
+long long int FileAgeSeconds(const std::string &path);
 std::string FileBaseName(const std::string &path);
 std::string FileParentDir(const std::string &path);
 std::string AbsPath(const std::string &path);
