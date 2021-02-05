@@ -47,7 +47,7 @@ std::string JoinStrings(const std::vector<std::string> &strings,
 int CopyFile(const std::string &dstname, const std::string &srcname);
 int CopyToDir(const std::string &dir, const std::string &srcname);
 int MoveToDir(const std::string &dir, const std::string &src);
-int RemoveFile(const std::string &path);
+int RemoveFile(const std::string &path, bool may_not_exist = false);
 
 int ExecuteCommand(std::stringstream &cmdss, bool verbose = false,
 		   bool daemonize = false);

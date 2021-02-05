@@ -430,15 +430,21 @@ CopyToDir(const std::string &dir, const std::string &srcname)
 }
 
 int
-RemoveFile(const std::string &path)
+RemoveFile(const std::string &path, bool may_not_exist)
 {
 	if (!IsFile(path)) {
+		if (may_not_exist) {
+			return 0;
+		}
 		std::cerr << "Cannot remove " << path << ": not a file"
 			  << std::endl;
 		return -1;
 	}
 
 	if (unlink(path.c_str())) {
+		if (may_not_exist && errno == ENOENT) {
+			return 0;
+		}
 		std::cerr << "Failed to remove " << path << ": "
 			  << strerror(errno) << std::endl;
 		return -1;

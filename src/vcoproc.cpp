@@ -301,7 +301,6 @@ SQLiteDbConn::SelectStmt(const std::stringstream &ss, int verbose)
 }
 
 /* TODO
- *  - support mjson
  *  - state machine for multiple requests
  */
 
@@ -349,10 +348,11 @@ class PendingFile {
 	/* State of the CURL easy handle associated to this file. */
 	CurlState curl_state = CurlState::Idle;
 
-    public:
 	/* Temporary storage for external JSON metadata for this file. */
 	json11::Json jmdata;
+	std::string jmdatapath;
 
+    public:
 	/* Accumulator for the JSON output associated to this file. */
 	json11::Json::object jout;
 
@@ -377,6 +377,8 @@ class PendingFile {
 	static std::unique_ptr<PendingFile> Create(CURLM *curlm,
 						   const std::string &src_path,
 						   int verbose);
+	int LoadMetadata(const std::string &mdatapath);
+	json11::Json GetMetadata() const;
 	static size_t CurlWriteCallback(void *data, size_t size, size_t nmemb,
 					void *userp);
 	void AppendResponse(void *data, size_t size);
@@ -449,6 +451,10 @@ PendingFile::Create(CURLM *curlm, const std::string &src_path, int verbose)
 
 PendingFile::~PendingFile()
 {
+	if (!jmdatapath.empty()) {
+		RemoveFile(jmdatapath, /*may_not_exist=*/true);
+	}
+
 	if (curl != nullptr) {
 		CURLMcode cm;
 
@@ -461,6 +467,37 @@ PendingFile::~PendingFile()
 		}
 		curl_easy_cleanup(curl);
 	}
+}
+
+int
+PendingFile::LoadMetadata(const std::string &mdatapath)
+{
+	std::ifstream fin(mdatapath);
+	if (!fin) {
+		std::cerr << "Failed to open " << mdatapath << std::endl;
+		return -1;
+	}
+
+	std::string jstr((std::istreambuf_iterator<char>(fin)),
+			 std::istreambuf_iterator<char>());
+	std::string errs;
+
+	json11::Json js = json11::Json::parse(jstr, errs);
+	if (!errs.empty() && js == json11::Json()) {
+		std::cerr << logb(LogErr) << "Metadata is not a JSON: " << jstr
+			  << std::endl;
+		return -1;
+	}
+	jmdata	   = js;
+	jmdatapath = mdatapath;
+
+	return 0;
+}
+
+json11::Json
+PendingFile::GetMetadata() const
+{
+	return jmdata;
 }
 
 size_t
@@ -1329,31 +1366,10 @@ VCoproc::MainLoop()
 			    PathJoin(FileParentDir(pf->FilePath()),
 				     "metadata.json")};
 			for (const auto &mdatapath : mdatapaths) {
-				if (!IsFile(mdatapath)) {
-					continue;
+				if (IsFile(mdatapath) &&
+				    pf->LoadMetadata(mdatapath) == 0) {
+					break;
 				}
-
-				std::ifstream fin(mdatapath);
-				if (!fin) {
-					std::cerr << "Failed to open "
-						  << mdatapath << std::endl;
-					continue;
-				}
-
-				std::string jstr(
-				    (std::istreambuf_iterator<char>(fin)),
-				    std::istreambuf_iterator<char>());
-				std::string errs;
-
-				json11::Json js =
-				    json11::Json::parse(jstr, errs);
-				if (!errs.empty() && js == json11::Json()) {
-					std::cerr << logb(LogErr)
-						  << "Metadata is not a JSON: "
-						  << jstr << std::endl;
-					continue;
-				}
-				pf->jmdata = js;
 			}
 
 			/* Make a POST request. */
@@ -1460,8 +1476,12 @@ VCoproc::MainLoop()
 				    FileBaseName(pf->FilePath());
 				std::string jspath;
 
-				jsresp["origin"]   = source;
-				jsresp["metadata"] = pf->jmdata;
+				jsresp["origin"] = source;
+
+				json11::Json jmdata = pf->GetMetadata();
+				if (jmdata != json11::Json()) {
+					jsresp["metadata"] = jmdata;
+				}
 
 				jsname = PathNameNewExt(jsname, "json");
 				jspath = PathJoin(output_dir, jsname);
