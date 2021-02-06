@@ -53,6 +53,9 @@ Usage(const char *progname)
 	    << "    -m (monitor input directories rather than stop when "
 	       "running out of files)"
 	    << std::endl
+	    << "    -n MAX_PENDING_TRANSACTIONS (max number of concurrent "
+	       "processing transactions)"
+	    << std::endl
 	    << "    -H BACKEND_HOST (address or name of the backend engine)"
 	    << std::endl
 	    << "    -p BACKEND_PORT (TCP port of the backend engine)"
@@ -821,6 +824,13 @@ class VCoproc {
 	std::string output_dir;
 	std::string failed_dir;
 	std::string forward_dir;
+
+	/*
+	 * Max number of in progress entries that we allow in the
+	 * pending table at any time.
+	 */
+	unsigned short max_pending = 5;
+
 	std::string dbfile;
 	std::unique_ptr<SQLiteDbConn> dbconn;
 	std::string host;
@@ -851,12 +861,6 @@ class VCoproc {
 	} stats;
 	std::chrono::time_point<std::chrono::system_clock> stats_start;
 
-	/*
-	 * Max number of in progress entries that we allow in the
-	 * pending table at any time.
-	 */
-	static constexpr size_t MaxEntries = 5;
-
 	/* Map of in-progress pf entries. */
 	std::unordered_map<std::string, std::unique_ptr<PendingFile>> pending;
 
@@ -874,16 +878,18 @@ class VCoproc {
 	    int stopfd, int verbose, bool consume, bool monitor,
 	    std::string source, std::vector<std::string> input_dirs,
 	    std::vector<std::string> input_exts, std::string output_dir,
-	    std::string failed_dir, std::string forward_dir, std::string dbfile,
-	    std::string host, unsigned short port);
+	    std::string failed_dir, std::string forward_dir,
+	    unsigned short max_pending, std::string dbfile, std::string host,
+	    unsigned short port);
 
 	VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend>, int verbose,
 		bool consume, bool monitor, std::string source,
 		std::vector<std::string> input_dirs,
 		std::vector<std::string> input_exts, std::string output_dir,
 		std::string failed_dir, std::string forward_dir,
-		std::string dbfile, std::unique_ptr<SQLiteDbConn> dbconn,
-		std::string host, unsigned short port);
+		unsigned short max_pending, std::string dbfile,
+		std::unique_ptr<SQLiteDbConn> dbconn, std::string host,
+		unsigned short port);
 	~VCoproc();
 	int MainLoop();
 };
@@ -893,7 +899,8 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		std::string source, std::vector<std::string> input_dirs,
 		std::vector<std::string> input_exts, std::string output_dir,
 		std::string failed_dir, std::string forward_dir,
-		std::string dbfile, std::string host, unsigned short port)
+		unsigned short max_pending, std::string dbfile,
+		std::string host, unsigned short port)
 {
 	if (source.empty()) {
 		std::cerr << logb(LogErr) << "No source/origin specified"
@@ -919,6 +926,13 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 
 	if (failed_dir.empty()) {
 		std::cerr << logb(LogErr) << "No failed directory specified"
+			  << std::endl;
+		return nullptr;
+	}
+
+	if (max_pending < 1 || max_pending > 512) {
+		std::cerr << logb(LogErr)
+			  << "Number of max pending transactions out of range"
 			  << std::endl;
 		return nullptr;
 	}
@@ -1006,8 +1020,8 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 	    stopfd, curlm, std::move(be), verbose, consume, monitor,
 	    std::move(source), std::move(input_dirs), std::move(input_exts),
 	    std::move(output_dir), std::move(failed_dir),
-	    std::move(forward_dir), std::move(dbfile), std::move(dbconn),
-	    std::move(host), port);
+	    std::move(forward_dir), max_pending, std::move(dbfile),
+	    std::move(dbconn), std::move(host), port);
 }
 
 VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
@@ -1015,8 +1029,9 @@ VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
 		 std::vector<std::string> input_dirs,
 		 std::vector<std::string> input_exts, std::string output_dir,
 		 std::string failed_dir, std::string forward_dir,
-		 std::string dbfile, std::unique_ptr<SQLiteDbConn> dbconn,
-		 std::string host, unsigned short port)
+		 unsigned short max_pending, std::string dbfile,
+		 std::unique_ptr<SQLiteDbConn> dbconn, std::string host,
+		 unsigned short port)
     : stopfd(stopfd),
       curlm(curlm),
       be(std::move(be)),
@@ -1029,6 +1044,7 @@ VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
       output_dir(std::move(output_dir)),
       failed_dir(std::move(failed_dir)),
       forward_dir(std::move(forward_dir)),
+      max_pending(max_pending),
       dbfile(std::move(dbfile)),
       dbconn(std::move(dbconn)),
       host(std::move(host)),
@@ -1056,11 +1072,11 @@ VCoproc::FetchMoreFiles()
 	/*
 	 * If we are consuming the files, the corresponding entries are
 	 * removed as soon as the post processing is complete, and so
-	 * we can limit the pending table to MaxEntries.
+	 * we can limit the pending table to max_pending.
 	 * Otherwise we must use a much larger limit.
 	 * TODO: maybe use DB to store the completed entries...
 	 */
-	int credits = consume ? MaxEntries : 8192;
+	int credits = consume ? max_pending : 8192;
 
 	assert(input_dir_idx < input_dirs.size());
 
@@ -1529,6 +1545,8 @@ VCoproc::MainLoop()
 				int r =
 				    pf->bt->ProcessResponse(jsresp, pf->jout);
 				if (r == 0) {
+					std::cout << "TRANSACTION NOT COMPLETE"
+						  << std::endl;
 					/* The transaction is not complete. */
 					pf->SetState(PendState::ReadyToSubmit);
 					continue;
@@ -1536,6 +1554,10 @@ VCoproc::MainLoop()
 				success = r > 0;
 			}
 
+			/*
+			 * Transaction is complete. Finalize and output the
+			 * JSON.
+			 */
 			double audio_len  = 0;
 			double speech_len = 0;
 
@@ -1712,6 +1734,7 @@ main(int argc, char **argv)
 {
 	std::vector<std::string> input_dirs;
 	std::vector<std::string> input_exts;
+	unsigned short max_pending = 5;
 	std::string output_dir;
 	std::string failed_dir;
 	std::string forward_dir;
@@ -1759,7 +1782,7 @@ main(int argc, char **argv)
 		return ret;
 	}
 
-	while ((opt = getopt(argc, argv, "hVvi:o:F:f:cmD:H:p:s:e:")) != -1) {
+	while ((opt = getopt(argc, argv, "hVvi:o:F:f:cmD:H:p:s:e:n:")) != -1) {
 		switch (opt) {
 		case 'h':
 			Usage(argv[0]);
@@ -1831,6 +1854,15 @@ main(int argc, char **argv)
 			monitor = true;
 			break;
 
+		case 'n':
+			if (!Str2Num<unsigned short>(optarg, max_pending)) {
+				std::cerr << logb(LogErr)
+					  << "Invalid value for -n: " << optarg
+					  << std::endl;
+				return -1;
+			}
+			break;
+
 		case 'D':
 			dbfile = std::string(optarg);
 			break;
@@ -1868,7 +1900,8 @@ main(int argc, char **argv)
 	auto vcoproc = VCoproc::Create(
 	    stopfd_global, verbose, consume, monitor, std::move(source),
 	    std::move(input_dirs), std::move(input_exts), std::move(output_dir),
-	    std::move(failed_dir), std::move(forward_dir), dbfile, host, port);
+	    std::move(failed_dir), std::move(forward_dir), max_pending, dbfile,
+	    host, port);
 	if (vcoproc == nullptr) {
 		return -1;
 	}
