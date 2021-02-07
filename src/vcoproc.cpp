@@ -946,6 +946,17 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		return nullptr;
 	}
 
+	/*
+	 * If we are consuming the files, the corresponding entries are
+	 * removed as soon as the post processing is complete, and so
+	 * we can limit the pending table to max_pending.
+	 * Otherwise we must use a much larger limit.
+	 * TODO: maybe use DB to store the completed entries...
+	 */
+	if (!consume) {
+		max_pending = 8192;
+	}
+
 	if (dbfile.empty()) {
 		std::cerr << logb(LogErr) << "No database file specified"
 			  << std::endl;
@@ -1078,14 +1089,7 @@ VCoproc::~VCoproc()
 int
 VCoproc::FetchMoreFiles()
 {
-	/*
-	 * If we are consuming the files, the corresponding entries are
-	 * removed as soon as the post processing is complete, and so
-	 * we can limit the pending table to max_pending.
-	 * Otherwise we must use a much larger limit.
-	 * TODO: maybe use DB to store the completed entries...
-	 */
-	int credits = consume ? max_pending : 8192;
+	int credits = max_pending;
 
 	assert(input_dir_idx < input_dirs.size());
 
@@ -1246,7 +1250,7 @@ VCoproc::CleanupCompleted()
 				std::cout << logb(LogDbg) << "Completed "
 					  << pf->FilePath() << std::endl;
 			}
-			it = pending.erase(it);
+			it	 = pending.erase(it);
 			dry_runs = 0;
 		} else {
 			++it;
@@ -1710,7 +1714,8 @@ VCoproc::MainLoop()
 		 * activities, stop if we are not in monitor mode.
 		 */
 		if (!monitor) {
-			if (dry_runs > 0 && num_running_curls == 0 && pending.size() == 0 && new_files == 0) {
+			if (dry_runs > 0 && num_running_curls == 0 &&
+			    pending.size() == 0 && new_files == 0) {
 				break;
 			}
 			dry_runs++;
