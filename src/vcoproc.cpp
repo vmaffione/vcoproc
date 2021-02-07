@@ -844,13 +844,12 @@ class VCoproc {
 	bool bail_out = false;
 
 	/*
-	 * Dry run counter, useful if monitor is false.
-	 * Set to 0 by the MainLoop anytime there is some activity.
+	 * Incremented by the MainLoop anytime there is some activity.
 	 * If an iteration completes without any activity, we allow
 	 * one more iteration before stopping, because more files
 	 * may be available.
 	 */
-	int dry_runs = 0;
+	int progress = 0;
 
 	struct {
 		uint64_t files_scored	 = 0;
@@ -946,17 +945,6 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		return nullptr;
 	}
 
-	/*
-	 * If we are consuming the files, the corresponding entries are
-	 * removed as soon as the post processing is complete, and so
-	 * we can limit the pending table to max_pending.
-	 * Otherwise we must use a much larger limit.
-	 * TODO: maybe use DB to store the completed entries...
-	 */
-	if (!consume) {
-		max_pending = 8192;
-	}
-
 	if (dbfile.empty()) {
 		std::cerr << logb(LogErr) << "No database file specified"
 			  << std::endl;
@@ -977,6 +965,17 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 	if (monitor) {
 		/* We must consume in monitor mode. */
 		consume = true;
+	}
+
+	/*
+	 * If we are consuming the files, the corresponding entries are
+	 * removed as soon as the post processing is complete, and so
+	 * we can limit the pending table to max_pending.
+	 * Otherwise we must use a much larger limit.
+	 * TODO: maybe use DB to store the completed entries...
+	 */
+	if (!consume) {
+		max_pending = 8192;
 	}
 
 	auto be = PsBackend::Create(host, port);
@@ -1251,7 +1250,7 @@ VCoproc::CleanupCompleted()
 					  << pf->FilePath() << std::endl;
 			}
 			it	 = pending.erase(it);
-			dry_runs = 0;
+			progress++;
 		} else {
 			++it;
 		}
@@ -1317,7 +1316,7 @@ VCoproc::PostProcess()
 		stats.procsec_completed += pf->AgeSeconds();
 
 		pf->SetState(PendState::Complete);
-		dry_runs = 0;
+		progress++;
 	}
 }
 
@@ -1328,9 +1327,9 @@ VCoproc::TimeoutWaiting()
 		auto &pf = kv.second;
 
 		if (pf->State() == PendState::WaitingResponse &&
-		    pf->InactivitySeconds() > 1.0) {
+		    pf->InactivitySeconds() > 120.0) {
 			pf->SetState(PendState::ProcFailure);
-			dry_runs = 0;
+			progress++;
 			std::cerr << logb(LogErr) << "File " << pf->FilePath()
 				  << " timed out" << std::endl;
 			stats.files_failed++;
@@ -1449,14 +1448,12 @@ VCoproc::MainLoop()
 		}
 
 		/* Scan any new entries and carry out some pre-processing. */
-		int new_files = 0;
 		for (auto &kv : pending) {
 			auto &pf = kv.second;
 
 			if (pf->State() != PendState::New) {
 				continue;
 			}
-			new_files++;
 
 			/* Check if we have a JSON file containing metadata. */
 			std::vector<std::string> mdatapaths = {
@@ -1470,7 +1467,7 @@ VCoproc::MainLoop()
 				}
 			}
 			pf->SetState(PendState::ReadyToSubmit);
-			dry_runs = 0;
+			progress++;
 		}
 
 		/*
@@ -1484,7 +1481,7 @@ VCoproc::MainLoop()
 				continue;
 			}
 
-			dry_runs = 0;
+			progress++;
 
 			json11::Json jsreq;
 			std::string url;
@@ -1545,7 +1542,7 @@ VCoproc::MainLoop()
 				http_code = 400;
 			}
 
-			dry_runs = 0;
+			progress++;
 
 			if (http_code == 0) {
 				/*
@@ -1713,15 +1710,16 @@ VCoproc::MainLoop()
 		 * When there are no more files to be processed or pending
 		 * activities, stop if we are not in monitor mode.
 		 */
-		if (!monitor) {
-			if (dry_runs > 0 && num_running_curls == 0 &&
-			    pending.size() == 0 && new_files == 0) {
-				break;
-			}
-			dry_runs++;
+		if (!monitor && progress == 0 && num_running_curls == 0) {
+			break;
 		}
 
-		int timeout_ms = pending.size() < max_pending ? 0 : 5000;
+		int timeout_ms =
+		    (progress > 0 && num_running_curls == 0) ? 0 : 5000;
+
+		if (num_running_curls == 0) {
+			progress = 0;
+		}
 
 		/*
 		 * Wait for any activity on POST transfers or on the stop
