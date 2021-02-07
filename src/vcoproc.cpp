@@ -843,6 +843,15 @@ class VCoproc {
 	 */
 	bool bail_out = false;
 
+	/*
+	 * Dry run counter, useful if monitor is false.
+	 * Set to 0 by the MainLoop anytime there is some activity.
+	 * If an iteration completes without any activity, we allow
+	 * one more iteration before stopping, because more files
+	 * may be available.
+	 */
+	int dry_runs = 0;
+
 	struct {
 		uint64_t files_scored	 = 0;
 		uint64_t bytes_scored	 = 0;
@@ -1238,6 +1247,7 @@ VCoproc::CleanupCompleted()
 					  << pf->FilePath() << std::endl;
 			}
 			it = pending.erase(it);
+			dry_runs = 0;
 		} else {
 			++it;
 		}
@@ -1303,6 +1313,7 @@ VCoproc::PostProcess()
 		stats.procsec_completed += pf->AgeSeconds();
 
 		pf->SetState(PendState::Complete);
+		dry_runs = 0;
 	}
 }
 
@@ -1315,6 +1326,7 @@ VCoproc::TimeoutWaiting()
 		if (pf->State() == PendState::WaitingResponse &&
 		    pf->InactivitySeconds() > 1.0) {
 			pf->SetState(PendState::ProcFailure);
+			dry_runs = 0;
 			std::cerr << logb(LogErr) << "File " << pf->FilePath()
 				  << " timed out" << std::endl;
 			stats.files_failed++;
@@ -1417,7 +1429,6 @@ int
 VCoproc::MainLoop()
 {
 	int num_running_curls = 0;
-	int timeout_ms	      = 5000;
 	std::string base_url;
 	int err = 0;
 
@@ -1455,6 +1466,7 @@ VCoproc::MainLoop()
 				}
 			}
 			pf->SetState(PendState::ReadyToSubmit);
+			dry_runs = 0;
 		}
 
 		/*
@@ -1467,6 +1479,8 @@ VCoproc::MainLoop()
 			if (pf->State() != PendState::ReadyToSubmit) {
 				continue;
 			}
+
+			dry_runs = 0;
 
 			json11::Json jsreq;
 			std::string url;
@@ -1526,6 +1540,8 @@ VCoproc::MainLoop()
 				    << curl_easy_strerror(cc) << std::endl;
 				http_code = 400;
 			}
+
+			dry_runs = 0;
 
 			if (http_code == 0) {
 				/*
@@ -1693,9 +1709,14 @@ VCoproc::MainLoop()
 		 * When there are no more files to be processed or pending
 		 * activities, stop if we are not in monitor mode.
 		 */
-		if (num_running_curls == 0 && new_files == 0 && !monitor) {
-			break;
+		if (!monitor) {
+			if (dry_runs > 0 && num_running_curls == 0 && pending.size() == 0 && new_files == 0) {
+				break;
+			}
+			dry_runs++;
 		}
+
+		int timeout_ms = pending.size() < max_pending ? 0 : 5000;
 
 		/*
 		 * Wait for any activity on POST transfers or on the stop
