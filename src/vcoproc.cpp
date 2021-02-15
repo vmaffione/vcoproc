@@ -658,7 +658,7 @@ class PsBackendTransaction : public BackendTransaction {
 		WaitForProcess = 3,
 		Finished       = 4,
 	};
-#if 0
+#if 1
 	State state = State::Init;
 #else
 	State state = State::ReadyToProcess;
@@ -871,8 +871,8 @@ class VCoproc {
 	std::string forward_dir;
 
 	/*
-	 * Max number of in progress entries that we allow in
-	 * the pending table at any time.
+	 * Max number of entries that we allow in the pending table
+	 * at any time.
 	 */
 	unsigned short max_pending = 5;
 
@@ -1021,18 +1021,6 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 	if (monitor) {
 		/* We must consume in monitor mode. */
 		consume = true;
-	}
-
-	/*
-	 * If we are consuming the files, the corresponding
-	 * entries are removed as soon as the post processing is
-	 * complete, and so we can limit the pending table to
-	 * max_pending. Otherwise we must use a much larger
-	 * limit.
-	 * TODO: maybe use DB to store the completed entries...
-	 */
-	if (!consume) {
-		max_pending = 8192;
 	}
 
 	auto be = PsBackend::Create(host, port);
@@ -1283,9 +1271,12 @@ VCoproc::FetchFilesFromDir(const std::string &dirname,
 		}
 
 		/*
-		 * We got a file good for processing. Insert it
-		 * into the database (if it's not already there)
-		 * and decrease the credits.
+		 * We got a file good for processing. Insert it into the
+		 * pending table (if it's not already there) and decrease
+		 * the credits. To support the case where files are not
+		 * consumed, we don't decrement the credits if the file
+		 * is in the Complete state. In any case we enforce
+		 * a sane limit.
 		 */
 		std::string apath = AbsPath(path);
 
@@ -1296,7 +1287,12 @@ VCoproc::FetchFilesFromDir(const std::string &dirname,
 			path = apath;
 		}
 
-		if (!pending.count(path)) {
+		const auto pit = pending.find(path);
+
+		if (pit != pending.end() &&
+		    (consume || pit->second->State() != PendState::Complete)) {
+			credits--;
+		} else if (pit == pending.end() && pending.size() < 16384) {
 			pending[path] = std::move(PendingFile::Create(
 			    std::move(be->CreateTransaction(path)), curlm, path,
 			    verbose));
@@ -1305,8 +1301,8 @@ VCoproc::FetchFilesFromDir(const std::string &dirname,
 					  << std::endl;
 			}
 			ret++; /* increment file count */
+			credits--;
 		}
-		credits--;
 	}
 
 	closedir(dir);
