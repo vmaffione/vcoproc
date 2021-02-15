@@ -101,6 +101,8 @@ class TestRequestHandler(myhttp.RequestHandler):
                 # Demux to the proper POST handler.
                 if p == '/process':
                         return self.do_POST_process(p, jsreq)
+                elif p == '/ping':
+                        return self.return_json({'status': 'COMPLETE'})
                 else:
                         return self.return_error(404)
 

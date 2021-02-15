@@ -394,6 +394,7 @@ class PendingFile {
 	~PendingFile();
 
 	PendState State() const { return state; }
+	std::string StateStr() const;
 	void SetState(PendState state);
 	std::string FilePath() const { return src_path; }
 	size_t FileSize() const { return src_size; }
@@ -438,14 +439,6 @@ PendingFile::Create(std::unique_ptr<BackendTransaction> bt, CURLM *curlm,
 		return nullptr;
 	}
 
-	/* Add this handle to our multi stack. */
-	CURLMcode cm = curl_multi_add_handle(curlm, curl);
-	if (cm != CURLM_OK) {
-		std::cerr << "Failed to add handle to multi stack: "
-			  << curl_multi_strerror(cm) << std::endl;
-		return nullptr;
-	}
-
 	long long int src_size = utils::FileSize(src_path);
 	if (src_size < 0) {
 		return nullptr;
@@ -481,17 +474,31 @@ PendingFile::~PendingFile()
 	}
 
 	if (curl != nullptr) {
-		CURLMcode cm;
-
-		assert(curlm != nullptr);
-		cm = curl_multi_remove_handle(curlm, curl);
-		if (cm != CURLM_OK) {
-			std::cerr
-			    << "Failed to remove handle from multi stack: "
-			    << curl_multi_strerror(cm) << std::endl;
-		}
 		curl_easy_cleanup(curl);
 	}
+}
+
+std::string
+PendingFile::StateStr() const
+{
+	switch (state) {
+	case PendState::None:
+		return "None";
+	case PendState::New:
+		return "New";
+	case PendState::ReadyToSubmit:
+		return "ReadyToSubmit";
+	case PendState::WaitingResponse:
+		return "WaitingResponse";
+	case PendState::ProcSuccess:
+		return "ProcSuccess";
+	case PendState::ProcFailure:
+		return "ProcFailure";
+	case PendState::Complete:
+		return "Complete";
+	}
+
+	return std::string();
 }
 
 int
@@ -599,6 +606,14 @@ PendingFile::PreparePost(const std::string &url, const json11::Json &jsreq)
 		return -1;
 	}
 
+	/* Add this handle to our multi stack. */
+	CURLMcode cm = curl_multi_add_handle(curlm, curl);
+	if (cm != CURLM_OK) {
+		std::cerr << "Failed to add handle to multi stack: "
+			  << curl_multi_strerror(cm) << std::endl;
+		return -1;
+	}
+
 	curl_state    = CurlState::Prepared;
 	last_activity = std::chrono::system_clock::now();
 
@@ -616,6 +631,12 @@ PendingFile::RetirePost(json11::Json &jsresp)
 			  << "Cannot compete POST: Invalid state "
 			  << static_cast<int>(curl_state) << std::endl;
 		return -1;
+	}
+
+	CURLMcode cm = curl_multi_remove_handle(curlm, curl);
+	if (cm != CURLM_OK) {
+		std::cerr << "Failed to remove handle from multi stack: "
+			  << curl_multi_strerror(cm) << std::endl;
 	}
 
 	respstr = postresp.str();
@@ -644,8 +665,10 @@ class PsBackendTransaction : public BackendTransaction {
 	std::string filepath;
 	enum class State {
 		Init	       = 0,
-		WaitForProcess = 1,
-		Finished       = 2,
+		WaitForPing    = 1,
+		ReadyToProcess = 2,
+		WaitForProcess = 3,
+		Finished       = 4,
 	};
 	State state = State::Init;
 
@@ -663,6 +686,15 @@ PsBackendTransaction::PrepareRequest(std::string &url, json11::Json &jsreq)
 {
 	switch (state) {
 	case State::Init: {
+		url   = be->BaseUrl() + "/ping";
+		jsreq = json11::Json::object{
+		    {"notsig", "whatnot"},
+		};
+		state = State::WaitForPing;
+		break;
+	}
+
+	case State::ReadyToProcess: {
 		url   = be->BaseUrl() + "/process";
 		jsreq = json11::Json::object{
 		    {"file_name", filepath},
@@ -672,7 +704,8 @@ PsBackendTransaction::PrepareRequest(std::string &url, json11::Json &jsreq)
 	}
 
 	default:
-		std::cerr << "PrepareRequest() called in illegal state "
+		std::cerr << "PrepareRequest() called in "
+			     "illegal state "
 			  << static_cast<int>(state) << std::endl;
 		return -1;
 		break;
@@ -687,14 +720,20 @@ PsBackendTransaction::ProcessResponse(json11::Json &jsresp,
 {
 	jout = jsresp.object_items();
 	switch (state) {
+	case State::WaitForPing:
+		state = State::ReadyToProcess;
+		break;
+
 	case State::WaitForProcess:
 		jout  = jsresp.object_items();
-		state = State::Finished; /* Transaction is now complete. */
+		state = State::Finished; /* Transaction is now
+					    complete. */
 		return 1;
 		break;
 
 	default:
-		std::cerr << "ProcessResponse() called in illegal state "
+		std::cerr << "ProcessResponse() called in "
+			     "illegal state "
 			  << static_cast<int>(state) << std::endl;
 		return -1;
 		break;
@@ -743,7 +782,8 @@ PsBackend::Probe()
 		return false;
 	}
 
-	/* Write callback to push data to a local stringstream variable. */
+	/* Write callback to push data to a local stringstream
+	 * variable. */
 	std::stringstream getresp;
 	auto writef = [](void *data, size_t size, size_t nitems, void *userp) {
 		std::stringstream *getresp = (std::stringstream *)userp;
@@ -766,8 +806,9 @@ PsBackend::Probe()
 	}
 
 	/*
-	 * The "+" magic forces a conversion to a C-style function pointer.
-	 * The writef function cannot have captures.
+	 * The "+" magic forces a conversion to a C-style
+	 * function pointer. The writef function cannot have
+	 * captures.
 	 */
 	cc = curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +writef);
 	if (cc != CURLE_OK) {
@@ -792,7 +833,8 @@ PsBackend::Probe()
 		cc =
 		    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
 		if (cc != CURLE_OK) {
-			std::cerr << "Failed to get CURLINFO_RESPONSE_CODE: "
+			std::cerr << "Failed to get "
+				     "CURLINFO_RESPONSE_CODE: "
 				  << curl_easy_strerror(cc) << std::endl;
 			goto end;
 		}
@@ -826,8 +868,8 @@ class VCoproc {
 	std::string forward_dir;
 
 	/*
-	 * Max number of in progress entries that we allow in the
-	 * pending table at any time.
+	 * Max number of in progress entries that we allow in
+	 * the pending table at any time.
 	 */
 	unsigned short max_pending = 5;
 
@@ -840,14 +882,17 @@ class VCoproc {
 	/*
 	 * Set by any routine in the MainLoop on unrecoverable
 	 * errors. The MainLoop will stop ASAP.
+	 * TODO currently only set by PostProcessFiles(). If
+	 * this is the final situation, get rid of this variable
+	 * and use the PostProcessFiles() return value.
 	 */
 	bool bail_out = false;
 
 	/*
-	 * Incremented by the MainLoop anytime there is some activity.
-	 * If an iteration completes without any activity, we allow
-	 * one more iteration before stopping, because more files
-	 * may be available.
+	 * Incremented by the MainLoop anytime there is some
+	 * activity. If an iteration completes without any
+	 * activity, we allow one more iteration before
+	 * stopping, because more files may be available.
 	 */
 	int progress = 0;
 
@@ -883,6 +928,8 @@ class VCoproc {
 	void CleanupCompletedFiles();
 	int UpdateStatistics(bool force);
 	int WaitForBackend();
+
+	void DumpPendingTable() const;
 
     public:
 	static std::unique_ptr<VCoproc> Create(
@@ -943,7 +990,8 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 
 	if (max_pending < 1 || max_pending > 512) {
 		std::cerr << logb(LogErr)
-			  << "Number of max pending transactions out of range"
+			  << "Number of max pending "
+			     "transactions out of range"
 			  << std::endl;
 		return nullptr;
 	}
@@ -971,10 +1019,11 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 	}
 
 	/*
-	 * If we are consuming the files, the corresponding entries are
-	 * removed as soon as the post processing is complete, and so
-	 * we can limit the pending table to max_pending.
-	 * Otherwise we must use a much larger limit.
+	 * If we are consuming the files, the corresponding
+	 * entries are removed as soon as the post processing is
+	 * complete, and so we can limit the pending table to
+	 * max_pending. Otherwise we must use a much larger
+	 * limit.
 	 * TODO: maybe use DB to store the completed entries...
 	 */
 	if (!consume) {
@@ -996,11 +1045,13 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		return nullptr;
 	}
 
-	/* Create the proc and stats tables if they do not exist already. */
+	/* Create the proc and stats tables if they do not exist
+	 * already. */
 	{
 		std::stringstream qss;
 		qss << "CREATE TABLE IF NOT EXISTS proc ("
-		    << "src_path VARCHAR(255) PRIMARY KEY NOT NULL, "
+		    << "src_path VARCHAR(255) PRIMARY KEY NOT "
+		       "NULL, "
 		    << "state TINYINT NOT NULL, "
 		    << "mjson TEXT)";
 		if (dbconn->ModifyStmt(qss, verbose)) {
@@ -1010,20 +1061,31 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 	{
 		std::stringstream qss;
 		qss << "CREATE TABLE IF NOT EXISTS stats ("
-		    << "timestamp UNSIGNED INTEGER PRIMARY KEY NOT NULL, "
-		    << "files_scored UNSIGNED INTEGER NOT NULL, "
-		    << "bytes_scored UNSIGNED INTEGER NOT NULL, "
+		    << "timestamp UNSIGNED INTEGER PRIMARY KEY "
+		       "NOT NULL, "
+		    << "files_scored UNSIGNED INTEGER NOT "
+		       "NULL, "
+		    << "bytes_scored UNSIGNED INTEGER NOT "
+		       "NULL, "
 		    << "audiosec_scored DOUBLE NOT NULL, "
 		    << "speechsec_scored DOUBLE NOT NULL, "
-		    << "files_nomdata UNSIGNED INTEGER NOT NULL, "
-		    << "bytes_nomdata UNSIGNED INTEGER NOT NULL, "
+		    << "files_nomdata UNSIGNED INTEGER NOT "
+		       "NULL, "
+		    << "bytes_nomdata UNSIGNED INTEGER NOT "
+		       "NULL, "
 		    << "audiosec_nomdata DOUBLE NOT NULL, "
-		    << "files_failed UNSIGNED INTEGER NOT NULL, "
-		    << "bytes_failed UNSIGNED INTEGER NOT NULL, "
-		    << "files_timedout UNSIGNED INTEGER NOT NULL, "
-		    << "bytes_timedout UNSIGNED INTEGER NOT NULL, "
-		    << "files_completed UNSIGNED INTEGER NOT NULL, "
-		    << "bytes_completed UNSIGNED INTEGER NOT NULL,"
+		    << "files_failed UNSIGNED INTEGER NOT "
+		       "NULL, "
+		    << "bytes_failed UNSIGNED INTEGER NOT "
+		       "NULL, "
+		    << "files_timedout UNSIGNED INTEGER NOT "
+		       "NULL, "
+		    << "bytes_timedout UNSIGNED INTEGER NOT "
+		       "NULL, "
+		    << "files_completed UNSIGNED INTEGER NOT "
+		       "NULL, "
+		    << "bytes_completed UNSIGNED INTEGER NOT "
+		       "NULL,"
 		    << "procsec_completed DOUBLE NOT NULL"
 		    << ")";
 		if (dbconn->ModifyStmt(qss, verbose)) {
@@ -1096,14 +1158,15 @@ VCoproc::FetchMoreFiles()
 	assert(input_dir_idx < input_dirs.size());
 
 	/*
-	 * Scan all the input directories, starting from the one that was
-	 * scanned less recently.
+	 * Scan all the input directories, starting from the one
+	 * that was scanned less recently.
 	 */
 	for (size_t n = 0; credits > 0 && n < input_dirs.size(); n++) {
 		/*
-		 * Visit this input directory and all of its input
-		 * subdirectories (recursively).
-		 * The visit is implemented as a BFS (Breadth First Search).
+		 * Visit this input directory and all of its
+		 * input subdirectories (recursively). The visit
+		 * is implemented as a BFS (Breadth First
+		 * Search).
 		 */
 		std::deque<std::string> frontier = {input_dirs[input_dir_idx]};
 
@@ -1145,8 +1208,8 @@ VCoproc::FetchFilesFromDir(const std::string &dirname,
 		}
 
 		/*
-		 * DT_UNKNOWN means that the file system does not
-		 * return file type information in d_type.
+		 * DT_UNKNOWN means that the file system does
+		 * not return file type information in d_type.
 		 * For such filesystem it is necessary to
 		 * use stat() or lstat() to check that it
 		 * is indeed a regular file.
@@ -1162,17 +1225,22 @@ VCoproc::FetchFilesFromDir(const std::string &dirname,
 		if (is_dir) {
 			if (DirEmpty(path) && FileAgeSeconds(path) > 30) {
 				/*
-				 * If we find an empty directory that has not
-				 * been modified in a short while, we remove
-				 * it. The age check prevents situations where
-				 * we remove directories created by the input
-				 * producer before the producer has the chance
-				 * to move something inside.
-				 * The removal also helps to do less BFS work.
+				 * If we find an empty directory
+				 * that has not been modified in
+				 * a short while, we remove it.
+				 * The age check prevents
+				 * situations where we remove
+				 * directories created by the
+				 * input producer before the
+				 * producer has the chance to
+				 * move something inside. The
+				 * removal also helps to do less
+				 * BFS work.
 				 */
 				if (rmdir(path.c_str())) {
 					std::cerr << logb(LogErr)
-						  << "Failed to remove empty "
+						  << "Failed to "
+						     "remove empty "
 						     "directory "
 						  << path << ": "
 						  << strerror(errno)
@@ -1180,14 +1248,16 @@ VCoproc::FetchFilesFromDir(const std::string &dirname,
 						  << std::flush;
 				} else if (verbose) {
 					std::cout << logb(LogDbg)
-						  << "Removed empty directory "
+						  << "Removed empty "
+						     "directory "
 						  << path << std::endl
 						  << std::flush;
 				}
 			} else {
 				/*
-				 * We found a non-empty subdirectory.
-				 * Append it to the BFS frontier set.
+				 * We found a non-empty
+				 * subdirectory. Append it to
+				 * the BFS frontier set.
 				 */
 				frontier.push_back(std::move(path));
 			}
@@ -1199,9 +1269,9 @@ VCoproc::FetchFilesFromDir(const std::string &dirname,
 		}
 
 		/*
-		 * We got a file good for processing. Insert it into the
-		 * database (if it's not already there) and decrease the
-		 * credits.
+		 * We got a file good for processing. Insert it
+		 * into the database (if it's not already there)
+		 * and decrease the credits.
 		 */
 		std::string apath = AbsPath(path);
 
@@ -1239,7 +1309,8 @@ VCoproc::PreProcessNewFiles()
 			continue;
 		}
 
-		/* Check if we have a JSON file containing metadata. */
+		/* Check if we have a JSON file containing
+		 * metadata. */
 		std::vector<std::string> mdatapaths = {
 		    PathNameNewExt(pf->FilePath(), "json"),
 		    PathJoin(FileParentDir(pf->FilePath()), "metadata.json")};
@@ -1304,7 +1375,8 @@ VCoproc::RetireAndProcessPostResponses()
 		cc = curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE,
 				       (char **)&pf);
 		if (cc != CURLE_OK) {
-			std::cerr << "Failed to get CURLINFO_PRIVATE: "
+			std::cerr << "Failed to get "
+				     "CURLINFO_PRIVATE: "
 				  << curl_easy_strerror(cc) << std::endl;
 			continue;
 		}
@@ -1312,7 +1384,8 @@ VCoproc::RetireAndProcessPostResponses()
 		cc = curl_easy_getinfo(msg->easy_handle, CURLINFO_RESPONSE_CODE,
 				       &http_code);
 		if (cc != CURLE_OK) {
-			std::cerr << "Failed to get CURLINFO_RESPONSE_CODE: "
+			std::cerr << "Failed to get "
+				     "CURLINFO_RESPONSE_CODE: "
 				  << curl_easy_strerror(cc) << std::endl;
 			http_code = 400;
 		}
@@ -1321,8 +1394,9 @@ VCoproc::RetireAndProcessPostResponses()
 
 		if (http_code == 0) {
 			/*
-			 * Backend down. No reason to advance the
-			 * pending requests. Those will be reprocessed.
+			 * Backend down. No reason to advance
+			 * the pending requests. Those will be
+			 * reprocessed.
 			 */
 			return false;
 		}
@@ -1335,9 +1409,8 @@ VCoproc::RetireAndProcessPostResponses()
 		} else {
 			int r = pf->bt->ProcessResponse(jsresp, pf->jout);
 			if (r == 0) {
-				std::cout << "TRANSACTION NOT COMPLETE"
-					  << std::endl;
-				/* The transaction is not complete. */
+				/* The transaction is not
+				 * complete yet. */
 				pf->SetState(PendState::ReadyToSubmit);
 				continue;
 			}
@@ -1345,8 +1418,8 @@ VCoproc::RetireAndProcessPostResponses()
 		}
 
 		/*
-		 * Transaction is complete. Finalize and output the
-		 * JSON.
+		 * Transaction is complete. Finalize and output
+		 * the JSON.
 		 */
 		double audio_len  = 0;
 		double speech_len = 0;
@@ -1532,11 +1605,15 @@ VCoproc::UpdateStatistics(bool force = false)
 	}
 
 	qss << "INSERT INTO stats(timestamp, files_scored, "
-	       "bytes_scored, audiosec_scored, speechsec_scored, "
-	       "files_nomdata, bytes_nomdata, audiosec_nomdata, "
-	       "files_failed, bytes_failed, files_timedout, bytes_timedout, "
+	       "bytes_scored, audiosec_scored, "
+	       "speechsec_scored, "
+	       "files_nomdata, bytes_nomdata, "
+	       "audiosec_nomdata, "
+	       "files_failed, bytes_failed, files_timedout, "
+	       "bytes_timedout, "
 	       "files_completed, bytes_completed, "
-	       "procsec_completed) VALUES(strftime('%s','now'), "
+	       "procsec_completed) "
+	       "VALUES(strftime('%s','now'), "
 	    << stats.files_scored << "," << stats.bytes_scored << ","
 	    << stats.audiosec_scored << "," << stats.speechsec_scored << ","
 	    << stats.files_nomdata << "," << stats.bytes_nomdata << ","
@@ -1572,9 +1649,10 @@ VCoproc::WaitForBackend()
 		if (ret < 0) {
 			if (errno == EINTR) {
 				/*
-				 * This happens if a signal was caught
-				 * during poll. We just continue, so that
-				 * the signal handler can write to the
+				 * This happens if a signal was
+				 * caught during poll. We just
+				 * continue, so that the signal
+				 * handler can write to the
 				 * stopfd and poll() returns 1.
 				 */
 				continue;
@@ -1587,8 +1665,8 @@ VCoproc::WaitForBackend()
 
 		if (ret > 0) {
 			/*
-			 * We got a termination signal. Return 1 to inform
-			 * the user.
+			 * We got a termination signal. Return 1
+			 * to inform the user.
 			 */
 			assert(pfd[0].revents & POLLIN);
 			EventFdDrain(stopfd);
@@ -1597,15 +1675,29 @@ VCoproc::WaitForBackend()
 		}
 
 		/*
-		 * It's safer to have the sleep before the first check
-		 * to rate limit this function (e.g., if Probe() always
-		 * returns true but there is some issue that triggers the
-		 * MainLoop to call WaitForBackend() again and again).
+		 * It's safer to have the sleep before the first
+		 * check to rate limit this function (e.g., if
+		 * Probe() always returns true but there is some
+		 * issue that triggers the MainLoop to call
+		 * WaitForBackend() again and again).
 		 */
 	} while (be->Probe() == false);
 
 	/* Backend is online. We can return. */
 	return 0;
+}
+
+void
+VCoproc::DumpPendingTable() const
+{
+	std::cout << "Pending Table:" << std::endl;
+	for (const auto &kv : pending) {
+		const auto &pf = kv.second;
+
+		std::cout << "    " << FileBaseName(pf->FilePath()) << ": "
+			  << pf->StateStr() << std::endl;
+	}
+	std::cout << "===============================" << std::endl;
 }
 
 int
@@ -1617,72 +1709,83 @@ VCoproc::MainLoop()
 
 	while (!bail_out) {
 		/*
-		 * Refill the pending table by fetching more files from the
-		 * input directories.
+		 * Refill the pending table by fetching more
+		 * files from the input directories.
 		 */
 		FetchMoreFiles();
 
-		/* Scan any new entries and carry out some pre-processing. */
+		/* Scan any new entries and carry out some
+		 * pre-processing. */
 		PreProcessNewFiles();
 
 		/*
-		 * Scan ReadyToSubmit entries, preparing the next POST request
-		 * to be submitted to the backend engine.
+		 * Scan ReadyToSubmit entries, preparing the
+		 * next POST request to be submitted to the
+		 * backend engine.
 		 */
 		PreparePostRequests();
 
-		/* Submit or advance any pending POST transfers. */
+		/* Submit or advance any pending POST transfers.
+		 */
 		CURLMcode cm = curl_multi_perform(curlm, &num_running_curls);
 		if (cm != CURLM_OK) {
-			std::cerr << "Failed to perform multi handle: "
+			std::cerr << "Failed to perform multi "
+				     "handle: "
 				  << curl_multi_strerror(cm) << std::endl;
 			break;
 		}
 
-		/* Retier and process any completed POST operations. */
+		/* Retier and process any completed POST
+		 * operations. */
 		if (!RetireAndProcessPostResponses()) {
 			/*
-			 * The backend went down for some reason.
-			 * Flush any pending requests and wait
-			 * for the backend to go back online.
+			 * The backend went down for some
+			 * reason. Flush any pending requests
+			 * and wait for the backend to go back
+			 * online.
 			 */
 			int ret;
 
 			/*
-			 * We could clear only the ones in waiting state,
-			 * but we won't bother because it's harmless to
-			 * reprocess already processed files.
+			 * We could clear only the ones in
+			 * waiting state, but we won't bother
+			 * because it's harmless to reprocess
+			 * already processed files.
 			 */
 			pending.clear();
 
-			std::cout << "Backend went offline. Waiting ..."
+			std::cout << "Backend went offline. "
+				     "Waiting ..."
 				  << std::endl;
 			ret = WaitForBackend();
 			if (ret != 0) {
 				/*
-				 * Stop on error (ret < 0) or because we got
-				 * the termination signal (ret > 0).
+				 * Stop on error (ret < 0) or
+				 * because we got the
+				 * termination signal (ret > 0).
 				 */
 				break;
 			}
 			std::cout << "Backend is back online!" << std::endl;
 
 			/*
-			 * It's convenient to start from the beginning
-			 * of the iteration, so that we fetch more files,
-			 * including the ones to reprocess.
+			 * It's convenient to start from the
+			 * beginning of the iteration, so that
+			 * we fetch more files, including the
+			 * ones to reprocess.
 			 */
 			continue;
 		}
 
 		/*
-		 * Post process any entries in ProcSuccess or ProcFailure state.
+		 * Post process any entries in ProcSuccess or
+		 * ProcFailure state.
 		 */
 		PostProcessFiles();
 
 		/*
-		 * Mark timed out entries as failed. They will be
-		 * removed during the next step.
+		 * Mark timed out entries as failed. They will
+		 * be removed during the next step.
 		 */
 		TimeoutWaitingRequests();
 
@@ -1697,14 +1800,29 @@ VCoproc::MainLoop()
 		UpdateStatistics();
 
 		/*
-		 * When there are no more files to be processed or pending
-		 * activities, stop if we are not in monitor mode.
+		 * When there are no more files to be processed
+		 * or pending activities, stop if we are not in
+		 * monitor mode.
 		 */
-		if (!monitor && progress == 0 && num_running_curls == 0) {
-			break;
+		if (!monitor && num_running_curls == 0) {
+			bool all_complete = true;
+
+			for (auto &kv : pending) {
+				auto &pf = kv.second;
+
+				if (pf->State() != PendState::Complete) {
+					all_complete = false;
+					break;
+				}
+			}
+
+			if (all_complete) {
+				break;
+			}
 		}
 
-		/* TODO document the timeout_ms/progress logic */
+		/* TODO document the timeout_ms/progress logic
+		 */
 		int timeout_ms =
 		    (progress > 0 && num_running_curls == 0) ? 0 : 5000;
 
@@ -1713,8 +1831,8 @@ VCoproc::MainLoop()
 		}
 
 		/*
-		 * Wait for any activity on POST transfers or on the stop
-		 * file descriptor.
+		 * Wait for any activity on POST transfers or on
+		 * the stop file descriptor.
 		 */
 		struct curl_waitfd wfd[1];
 		wfd[0].fd      = stopfd;
