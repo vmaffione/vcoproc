@@ -923,6 +923,8 @@ class VCoproc {
 	size_t FetchMoreFiles();
 	int FetchFilesFromDir(const std::string &dir,
 			      std::deque<std::string> &frontier, int &credits);
+	bool AnyPendingActivity(int num_running_curls) const;
+	bool AnyImmediateAction() const;
 	void PreProcessNewFiles();
 	void PreparePostRequests();
 	bool RetireAndProcessPostResponses();
@@ -1713,6 +1715,46 @@ VCoproc::DumpPendingTable() const
 	std::cout << "===============================" << std::endl;
 }
 
+bool
+VCoproc::AnyPendingActivity(int num_running_curls) const
+{
+	if (num_running_curls > 0) {
+		return true;
+	}
+
+	for (auto &kv : pending) {
+		auto &pf = kv.second;
+
+		if (pf->State() != PendState::Complete) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+bool
+VCoproc::AnyImmediateAction() const
+{
+	for (auto &kv : pending) {
+		auto &pf = kv.second;
+
+		switch (pf->State()) {
+		case PendState::New:
+		case PendState::ReadyToSubmit:
+		case PendState::ProcSuccess:
+		case PendState::ProcFailure:
+		case PendState::Complete:
+			return true;
+			break;
+		default:
+			break;
+		}
+	}
+
+	return false;
+}
+
 int
 VCoproc::MainLoop()
 {
@@ -1734,34 +1776,19 @@ VCoproc::MainLoop()
 		 * or pending activities, stop if we are not in
 		 * monitor mode.
 		 */
-		if (!monitor && new_files == 0 && num_running_curls == 0) {
-			bool all_complete = true;
-
-			for (auto &kv : pending) {
-				auto &pf = kv.second;
-
-				if (pf->State() != PendState::Complete) {
-					all_complete = false;
-					break;
-				}
-			}
-
-			if (all_complete) {
-				/* We can stop. */
-				break;
-			}
+		if (!monitor && new_files == 0 &&
+		    !AnyPendingActivity(num_running_curls)) {
+			break;
 		}
 
 		/*
 		 * Wait for any activity on CURL transfers or on the stop
-		 * file descriptor. We set a non-zero timeout if there are
-		 * in-progress CURL transfers or we run out of new files.
-		 * Otherwise it means that there are no in-progress transfers
-		 * and there are new files: in that case we set a zero timeout
-		 * because we just want to check the stop file descriptor.
+		 * file descriptor. We set a zero timeout if there is any
+		 * MainLoop operation that can be acted on immediately
+		 * (i.e., without waiting). Otherwise we set a non-zero
+		 * timeout and possibly wait.
 		 */
-		int timeout_ms =
-		    (num_running_curls > 0 || new_files == 0) ? 5000 : 0;
+		int timeout_ms = AnyImmediateAction() ? 0 : 5000;
 		struct curl_waitfd wfd[1];
 		wfd[0].fd      = stopfd;
 		wfd[0].events  = CURL_WAIT_POLLIN;
