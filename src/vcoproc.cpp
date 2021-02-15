@@ -406,7 +406,7 @@ class PendingFile {
 					void *userp);
 	void AppendResponse(void *data, size_t size);
 	int PreparePost(const std::string &url, const json11::Json &jsreq);
-	int CompletePost(json11::Json &jsresp);
+	int RetirePost(json11::Json &jsresp);
 	float InactivitySeconds() const { return SecsElapsed(last_activity); }
 	float AgeSeconds() const { return SecsElapsed(proc_start); }
 };
@@ -606,7 +606,7 @@ PendingFile::PreparePost(const std::string &url, const json11::Json &jsreq)
 }
 
 int
-PendingFile::CompletePost(json11::Json &jsresp)
+PendingFile::RetirePost(json11::Json &jsresp)
 {
 	std::string respstr;
 	std::string errs;
@@ -872,12 +872,15 @@ class VCoproc {
 	/* Map of in-progress pf entries. */
 	std::unordered_map<std::string, std::unique_ptr<PendingFile>> pending;
 
-	int FetchMoreFiles();
+	void FetchMoreFiles();
 	int FetchFilesFromDir(const std::string &dir,
 			      std::deque<std::string> &frontier, int &credits);
-	int CleanupCompleted();
-	void PostProcess();
-	int TimeoutWaiting();
+	void PreProcessNewFiles();
+	void PreparePostRequests();
+	bool RetireAndProcessPostResponses();
+	void TimeoutWaitingRequests();
+	void PostProcessFiles();
+	void CleanupCompletedFiles();
 	int UpdateStatistics(bool force);
 	int WaitForBackend();
 
@@ -1085,7 +1088,7 @@ VCoproc::~VCoproc()
 	}
 }
 
-int
+void
 VCoproc::FetchMoreFiles()
 {
 	int credits = max_pending;
@@ -1107,21 +1110,14 @@ VCoproc::FetchMoreFiles()
 		for (int c = 0; !frontier.empty() && credits > 0 && c < 32;
 		     c++) {
 			std::string &dir = frontier.front();
-			int ret;
 
-			ret = FetchFilesFromDir(dir, frontier, credits);
-			if (ret) {
-				return ret;
-			}
-
+			FetchFilesFromDir(dir, frontier, credits);
 			frontier.pop_front();
 		}
 		if (++input_dir_idx >= input_dirs.size()) {
 			input_dir_idx = 0;
 		}
 	}
-
-	return 0;
 }
 
 int
@@ -1233,8 +1229,196 @@ VCoproc::FetchFilesFromDir(const std::string &dirname,
 	return 0;
 }
 
-int
-VCoproc::CleanupCompleted()
+void
+VCoproc::PreProcessNewFiles()
+{
+	for (auto &kv : pending) {
+		auto &pf = kv.second;
+
+		if (pf->State() != PendState::New) {
+			continue;
+		}
+
+		/* Check if we have a JSON file containing metadata. */
+		std::vector<std::string> mdatapaths = {
+		    PathNameNewExt(pf->FilePath(), "json"),
+		    PathJoin(FileParentDir(pf->FilePath()), "metadata.json")};
+		for (const auto &mdatapath : mdatapaths) {
+			if (IsFile(mdatapath) &&
+			    pf->LoadMetadata(mdatapath) == 0) {
+				break;
+			}
+		}
+		pf->SetState(PendState::ReadyToSubmit);
+		progress++;
+	}
+}
+
+void
+VCoproc::PreparePostRequests()
+{
+	for (auto &kv : pending) {
+		auto &pf = kv.second;
+
+		if (pf->State() != PendState::ReadyToSubmit) {
+			continue;
+		}
+
+		progress++;
+
+		json11::Json jsreq;
+		std::string url;
+
+		/* Get the URL and content for the next POST. */
+		int r = pf->bt->PrepareRequest(url, jsreq);
+		if (r) {
+			pf->SetState(PendState::ProcFailure);
+			continue;
+		}
+		/* Setup the POST request with CURL. */
+		if (pf->PreparePost(url, jsreq)) {
+			pf->SetState(PendState::ProcFailure);
+			continue;
+		}
+		pf->SetState(PendState::WaitingResponse);
+	}
+}
+
+bool
+VCoproc::RetireAndProcessPostResponses()
+{
+	int msgs_left = -1;
+	CURLMsg *msg;
+
+	while ((msg = curl_multi_info_read(curlm, &msgs_left)) != nullptr) {
+		PendingFile *pf;
+		long http_code;
+		CURLcode cc;
+
+		if (msg->msg != CURLMSG_DONE) {
+			std::cerr << logb(LogErr) << "Got CURLM msg "
+				  << msg->msg << std::endl;
+			continue;
+		}
+
+		cc = curl_easy_getinfo(msg->easy_handle, CURLINFO_PRIVATE,
+				       (char **)&pf);
+		if (cc != CURLE_OK) {
+			std::cerr << "Failed to get CURLINFO_PRIVATE: "
+				  << curl_easy_strerror(cc) << std::endl;
+			continue;
+		}
+
+		cc = curl_easy_getinfo(msg->easy_handle, CURLINFO_RESPONSE_CODE,
+				       &http_code);
+		if (cc != CURLE_OK) {
+			std::cerr << "Failed to get CURLINFO_RESPONSE_CODE: "
+				  << curl_easy_strerror(cc) << std::endl;
+			http_code = 400;
+		}
+
+		progress++;
+
+		if (http_code == 0) {
+			/*
+			 * Backend down. No reason to advance the
+			 * pending requests. Those will be reprocessed.
+			 */
+			return false;
+		}
+
+		bool success = (http_code == 200);
+		json11::Json jsresp;
+
+		if (pf->RetirePost(jsresp)) {
+			success = false;
+		} else {
+			int r = pf->bt->ProcessResponse(jsresp, pf->jout);
+			if (r == 0) {
+				std::cout << "TRANSACTION NOT COMPLETE"
+					  << std::endl;
+				/* The transaction is not complete. */
+				pf->SetState(PendState::ReadyToSubmit);
+				continue;
+			}
+			success = r > 0;
+		}
+
+		/*
+		 * Transaction is complete. Finalize and output the
+		 * JSON.
+		 */
+		double audio_len  = 0;
+		double speech_len = 0;
+
+		if (verbose) {
+			std::cout << logb(LogDbg) << "Processed "
+				  << pf->FilePath() << " --> " << http_code
+				  << " " << json11::Json(pf->jout).dump()
+				  << std::endl;
+		}
+
+		if (!pf->jout.count("status")) {
+			std::cerr << logb(LogErr) << "Missing status key"
+				  << std::endl;
+			success = false;
+		} else {
+			success = (pf->jout["status"] == "COMPLETE") ||
+				  (pf->jout["status"] == "NOMETADATA");
+		}
+
+		if (pf->jout.count("length") &&
+		    pf->jout["length"].is_number()) {
+			audio_len = pf->jout["length"].number_value();
+		}
+		if (pf->jout.count("net_speech") &&
+		    pf->jout["net_speech"].is_number()) {
+			speech_len = pf->jout["net_speech"].number_value();
+		}
+
+		if (success) {
+			/* Output JSON. */
+			std::string jsname = FileBaseName(pf->FilePath());
+			std::string jspath;
+
+			pf->jout["origin"] = source;
+
+			json11::Json jmdata = pf->GetMetadata();
+			if (jmdata != json11::Json()) {
+				pf->jout["metadata"] = jmdata;
+			}
+
+			jsname = PathNameNewExt(jsname, "json");
+			jspath = PathJoin(output_dir, jsname);
+			std::ofstream fout(jspath);
+			fout << json11::Json(pf->jout).dump();
+			fout << std::endl;
+		}
+
+		if (!success) {
+			pf->SetState(PendState::ProcFailure);
+			stats.files_failed++;
+			stats.bytes_failed += pf->FileSize();
+		} else {
+			pf->SetState(PendState::ProcSuccess);
+			if (pf->jout["status"] == "COMPLETE") {
+				stats.files_scored++;
+				stats.bytes_scored += pf->FileSize();
+				stats.audiosec_scored += audio_len;
+				stats.speechsec_scored += speech_len;
+			} else {
+				stats.files_nomdata++;
+				stats.bytes_nomdata += pf->FileSize();
+				stats.audiosec_nomdata += audio_len;
+			}
+		}
+	}
+
+	return true;
+}
+
+void
+VCoproc::CleanupCompletedFiles()
 {
 	for (auto it = pending.begin(); it != pending.end();) {
 		auto &pf = it->second;
@@ -1249,18 +1433,16 @@ VCoproc::CleanupCompleted()
 				std::cout << logb(LogDbg) << "Completed "
 					  << pf->FilePath() << std::endl;
 			}
-			it	 = pending.erase(it);
+			it = pending.erase(it);
 			progress++;
 		} else {
 			++it;
 		}
 	}
-
-	return 0;
 }
 
 void
-VCoproc::PostProcess()
+VCoproc::PostProcessFiles()
 {
 	bool forward = !forward_dir.empty();
 
@@ -1320,8 +1502,8 @@ VCoproc::PostProcess()
 	}
 }
 
-int
-VCoproc::TimeoutWaiting()
+void
+VCoproc::TimeoutWaitingRequests()
 {
 	for (auto &kv : pending) {
 		auto &pf = kv.second;
@@ -1338,8 +1520,6 @@ VCoproc::TimeoutWaiting()
 			stats.bytes_timedout += pf->FileSize();
 		}
 	}
-
-	return 0;
 }
 
 int
@@ -1436,71 +1616,22 @@ VCoproc::MainLoop()
 	int err = 0;
 
 	while (!bail_out) {
-		bool backend_down = false;
-
 		/*
 		 * Refill the pending table by fetching more files from the
 		 * input directories.
 		 */
-		err = FetchMoreFiles();
-		if (err) {
-			break;
-		}
+		FetchMoreFiles();
 
 		/* Scan any new entries and carry out some pre-processing. */
-		for (auto &kv : pending) {
-			auto &pf = kv.second;
-
-			if (pf->State() != PendState::New) {
-				continue;
-			}
-
-			/* Check if we have a JSON file containing metadata. */
-			std::vector<std::string> mdatapaths = {
-			    PathNameNewExt(pf->FilePath(), "json"),
-			    PathJoin(FileParentDir(pf->FilePath()),
-				     "metadata.json")};
-			for (const auto &mdatapath : mdatapaths) {
-				if (IsFile(mdatapath) &&
-				    pf->LoadMetadata(mdatapath) == 0) {
-					break;
-				}
-			}
-			pf->SetState(PendState::ReadyToSubmit);
-			progress++;
-		}
+		PreProcessNewFiles();
 
 		/*
 		 * Scan ReadyToSubmit entries, preparing the next POST request
 		 * to be submitted to the backend engine.
 		 */
-		for (auto &kv : pending) {
-			auto &pf = kv.second;
+		PreparePostRequests();
 
-			if (pf->State() != PendState::ReadyToSubmit) {
-				continue;
-			}
-
-			progress++;
-
-			json11::Json jsreq;
-			std::string url;
-
-			/* Get the URL and content for the next POST. */
-			int r = pf->bt->PrepareRequest(url, jsreq);
-			if (r) {
-				pf->SetState(PendState::ProcFailure);
-				continue;
-			}
-			/* Setup the POST request with CURL. */
-			if (pf->PreparePost(url, jsreq)) {
-				pf->SetState(PendState::ProcFailure);
-				continue;
-			}
-			pf->SetState(PendState::WaitingResponse);
-		}
-
-		/* Advance any pending POST transfers. */
+		/* Submit or advance any pending POST transfers. */
 		CURLMcode cm = curl_multi_perform(curlm, &num_running_curls);
 		if (cm != CURLM_OK) {
 			std::cerr << "Failed to perform multi handle: "
@@ -1508,143 +1639,8 @@ VCoproc::MainLoop()
 			break;
 		}
 
-		/* Process any completed POST transfers. */
-		int msgs_left = -1;
-		CURLMsg *msg;
-		while ((msg = curl_multi_info_read(curlm, &msgs_left)) !=
-		       nullptr) {
-			PendingFile *pf;
-			long http_code;
-			CURLcode cc;
-
-			if (msg->msg != CURLMSG_DONE) {
-				std::cerr << logb(LogErr) << "Got CURLM msg "
-					  << msg->msg << std::endl;
-				continue;
-			}
-
-			cc = curl_easy_getinfo(msg->easy_handle,
-					       CURLINFO_PRIVATE, (char **)&pf);
-			if (cc != CURLE_OK) {
-				std::cerr << "Failed to get CURLINFO_PRIVATE: "
-					  << curl_easy_strerror(cc)
-					  << std::endl;
-				continue;
-			}
-
-			cc = curl_easy_getinfo(msg->easy_handle,
-					       CURLINFO_RESPONSE_CODE,
-					       &http_code);
-			if (cc != CURLE_OK) {
-				std::cerr
-				    << "Failed to get CURLINFO_RESPONSE_CODE: "
-				    << curl_easy_strerror(cc) << std::endl;
-				http_code = 400;
-			}
-
-			progress++;
-
-			if (http_code == 0) {
-				/*
-				 * Backend down. No reason to advance the
-				 * pending requests. Those will be reprocessed.
-				 */
-				backend_down = true;
-				break;
-			}
-
-			bool success = (http_code == 200);
-			json11::Json jsresp;
-
-			if (pf->CompletePost(jsresp)) {
-				success = false;
-			} else {
-				int r =
-				    pf->bt->ProcessResponse(jsresp, pf->jout);
-				if (r == 0) {
-					std::cout << "TRANSACTION NOT COMPLETE"
-						  << std::endl;
-					/* The transaction is not complete. */
-					pf->SetState(PendState::ReadyToSubmit);
-					continue;
-				}
-				success = r > 0;
-			}
-
-			/*
-			 * Transaction is complete. Finalize and output the
-			 * JSON.
-			 */
-			double audio_len  = 0;
-			double speech_len = 0;
-
-			if (verbose) {
-				std::cout << logb(LogDbg) << "Processed "
-					  << pf->FilePath() << " --> "
-					  << http_code << " "
-					  << json11::Json(pf->jout).dump()
-					  << std::endl;
-			}
-
-			if (!pf->jout.count("status")) {
-				std::cerr << logb(LogErr)
-					  << "Missing status key" << std::endl;
-				success = false;
-			} else {
-				success = (pf->jout["status"] == "COMPLETE") ||
-					  (pf->jout["status"] == "NOMETADATA");
-			}
-
-			if (pf->jout.count("length") &&
-			    pf->jout["length"].is_number()) {
-				audio_len = pf->jout["length"].number_value();
-			}
-			if (pf->jout.count("net_speech") &&
-			    pf->jout["net_speech"].is_number()) {
-				speech_len =
-				    pf->jout["net_speech"].number_value();
-			}
-
-			if (success) {
-				/* Output JSON. */
-				std::string jsname =
-				    FileBaseName(pf->FilePath());
-				std::string jspath;
-
-				pf->jout["origin"] = source;
-
-				json11::Json jmdata = pf->GetMetadata();
-				if (jmdata != json11::Json()) {
-					pf->jout["metadata"] = jmdata;
-				}
-
-				jsname = PathNameNewExt(jsname, "json");
-				jspath = PathJoin(output_dir, jsname);
-				std::ofstream fout(jspath);
-				fout << json11::Json(pf->jout).dump();
-				fout << std::endl;
-			}
-
-			if (!success) {
-				pf->SetState(PendState::ProcFailure);
-				stats.files_failed++;
-				stats.bytes_failed += pf->FileSize();
-			} else {
-				pf->SetState(PendState::ProcSuccess);
-				if (pf->jout["status"] == "COMPLETE") {
-					stats.files_scored++;
-					stats.bytes_scored += pf->FileSize();
-					stats.audiosec_scored += audio_len;
-					stats.speechsec_scored += speech_len;
-				} else {
-					stats.files_nomdata++;
-					stats.bytes_nomdata += pf->FileSize();
-					stats.audiosec_nomdata += audio_len;
-				}
-			}
-		}
-
-		if (backend_down) {
+		/* Retier and process any completed POST operations. */
+		if (!RetireAndProcessPostResponses()) {
 			/*
 			 * The backend went down for some reason.
 			 * Flush any pending requests and wait
@@ -1682,26 +1678,20 @@ VCoproc::MainLoop()
 		/*
 		 * Post process any entries in ProcSuccess or ProcFailure state.
 		 */
-		PostProcess();
+		PostProcessFiles();
 
 		/*
 		 * Mark timed out entries as failed. They will be
 		 * removed during the next step.
 		 */
-		err = TimeoutWaiting();
-		if (err) {
-			break;
-		}
+		TimeoutWaitingRequests();
 
 		/*
 		 * Remove any completed entries from the
 		 * pending table, to make space for new input
 		 * files.
 		 */
-		err = CleanupCompleted();
-		if (err) {
-			break;
-		}
+		CleanupCompletedFiles();
 
 		/* Update the statistics if necessary. */
 		UpdateStatistics();
@@ -1714,6 +1704,7 @@ VCoproc::MainLoop()
 			break;
 		}
 
+		/* TODO document the timeout_ms/progress logic */
 		int timeout_ms =
 		    (progress > 0 && num_running_curls == 0) ? 0 : 5000;
 
