@@ -303,15 +303,11 @@ SQLiteDbConn::SelectStmt(const std::stringstream &ss, int verbose)
 	return std::make_unique<SQLiteDbCursor>(dbh, pstmt);
 }
 
-/* TODO
- *  - state machine for multiple requests
- */
-
 class BackendTransaction {
     public:
-	virtual int PrepareRequest(std::string &url, json11::Json &jsreq) = 0;
-	virtual int ProcessResponse(json11::Json &jsresp,
-				    json11::Json::object &jout)		  = 0;
+	virtual int PrepareRequest(std::string &url, std::string &req) = 0;
+	virtual int ProcessResponse(std::string &resp,
+				    json11::Json::object &jout)	       = 0;
 };
 
 class Backend {
@@ -406,8 +402,8 @@ class PendingFile {
 	static size_t CurlWriteCallback(void *data, size_t size, size_t nmemb,
 					void *userp);
 	void AppendResponse(void *data, size_t size);
-	int PreparePost(const std::string &url, const json11::Json &jsreq);
-	int RetirePost(json11::Json &jsresp);
+	int PreparePostCurl(const std::string &url, const std::string &req);
+	int RetirePostCurl(std::string &resp);
 	float InactivitySeconds() const { return SecsElapsed(last_activity); }
 	float AgeSeconds() const { return SecsElapsed(proc_start); }
 };
@@ -565,7 +561,7 @@ PendingFile::AppendResponse(void *data, size_t size)
 
 /* Prepare a post request without performing it. */
 int
-PendingFile::PreparePost(const std::string &url, const json11::Json &jsreq)
+PendingFile::PreparePostCurl(const std::string &url, const std::string &req)
 {
 	CURLcode cc;
 
@@ -587,7 +583,7 @@ PendingFile::PreparePost(const std::string &url, const json11::Json &jsreq)
 	 * (by default), and therefore we must preserve it until the
 	 * end of the POST transfer.
 	 */
-	postreq = jsreq.dump();
+	postreq = req;
 	cc	= curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postreq.c_str());
 	if (cc != CURLE_OK) {
 		std::cerr << "Failed to set CURLOPT_POSTFIELDS: "
@@ -621,9 +617,8 @@ PendingFile::PreparePost(const std::string &url, const json11::Json &jsreq)
 }
 
 int
-PendingFile::RetirePost(json11::Json &jsresp)
+PendingFile::RetirePostCurl(std::string &respstr)
 {
-	std::string respstr;
 	std::string errs;
 
 	if (curl_state != CurlState::Prepared) {
@@ -642,13 +637,6 @@ PendingFile::RetirePost(json11::Json &jsresp)
 	respstr = postresp.str();
 	if (respstr.empty()) {
 		std::cerr << logb(LogErr) << "Response is empty" << std::endl;
-		return -1;
-	}
-
-	jsresp = json11::Json::parse(respstr, errs);
-	if (!errs.empty() && jsresp == json11::Json()) {
-		std::cerr << logb(LogErr)
-			  << "Response is not a JSON: " << respstr << std::endl;
 		return -1;
 	}
 
@@ -677,13 +665,15 @@ class PsBackendTransaction : public BackendTransaction {
 	    : be(be), filepath(filepath)
 	{
 	}
-	int PrepareRequest(std::string &url, json11::Json &jsreq);
-	int ProcessResponse(json11::Json &jsresp, json11::Json::object &jout);
+	int PrepareRequest(std::string &url, std::string &req);
+	int ProcessResponse(std::string &resp, json11::Json::object &jout);
 };
 
 int
-PsBackendTransaction::PrepareRequest(std::string &url, json11::Json &jsreq)
+PsBackendTransaction::PrepareRequest(std::string &url, std::string &req)
 {
+	json11::Json jsreq;
+
 	switch (state) {
 	case State::Init: {
 		url   = be->BaseUrl() + "/ping";
@@ -711,20 +701,31 @@ PsBackendTransaction::PrepareRequest(std::string &url, json11::Json &jsreq)
 		break;
 	}
 
+	req = jsreq.dump();
+
 	return 0;
 }
 
 int
-PsBackendTransaction::ProcessResponse(json11::Json &jsresp,
+PsBackendTransaction::ProcessResponse(std::string &resp,
 				      json11::Json::object &jout)
 {
-	jout = jsresp.object_items();
+	std::string errs;
+	json11::Json jsresp = json11::Json::parse(resp, errs);
+
+	if (!errs.empty() && jsresp == json11::Json()) {
+		std::cerr << logb(LogErr) << "Response is not a JSON: " << resp
+			  << std::endl;
+		return -1;
+	}
+
 	switch (state) {
 	case State::WaitForPing:
 		state = State::ReadyToProcess;
 		break;
 
 	case State::WaitForProcess:
+		/* Set jout. */
 		jout  = jsresp.object_items();
 		state = State::Finished; /* Transaction is now
 					    complete. */
@@ -732,7 +733,8 @@ PsBackendTransaction::ProcessResponse(json11::Json &jsresp,
 		break;
 
 	default:
-		std::cerr << "ProcessResponse() called in "
+		std::cerr << logb(LogErr)
+			  << "ProcessResponse() called in "
 			     "illegal state "
 			  << static_cast<int>(state) << std::endl;
 		return -1;
@@ -1337,17 +1339,17 @@ VCoproc::PreparePostRequests()
 
 		progress++;
 
-		json11::Json jsreq;
+		std::string req;
 		std::string url;
 
 		/* Get the URL and content for the next POST. */
-		int r = pf->bt->PrepareRequest(url, jsreq);
+		int r = pf->bt->PrepareRequest(url, req);
 		if (r) {
 			pf->SetState(PendState::ProcFailure);
 			continue;
 		}
 		/* Setup the POST request with CURL. */
-		if (pf->PreparePost(url, jsreq)) {
+		if (pf->PreparePostCurl(url, req)) {
 			pf->SetState(PendState::ProcFailure);
 			continue;
 		}
@@ -1402,12 +1404,12 @@ VCoproc::RetireAndProcessPostResponses()
 		}
 
 		bool success = (http_code == 200);
-		json11::Json jsresp;
+		std::string resp;
 
-		if (pf->RetirePost(jsresp)) {
+		if (pf->RetirePostCurl(resp)) {
 			success = false;
 		} else {
-			int r = pf->bt->ProcessResponse(jsresp, pf->jout);
+			int r = pf->bt->ProcessResponse(resp, pf->jout);
 			if (r == 0) {
 				/* The transaction is not
 				 * complete yet. */
