@@ -658,7 +658,11 @@ class PsBackendTransaction : public BackendTransaction {
 		WaitForProcess = 3,
 		Finished       = 4,
 	};
+#if 0
 	State state = State::Init;
+#else
+	State state = State::ReadyToProcess;
+#endif
 
     public:
 	PsBackendTransaction(Backend *be, const std::string &filepath)
@@ -677,9 +681,6 @@ PsBackendTransaction::PrepareRequest(std::string &url, std::string &req)
 	switch (state) {
 	case State::Init: {
 		url   = be->BaseUrl() + "/ping";
-		jsreq = json11::Json::object{
-		    {"notsig", "whatnot"},
-		};
 		state = State::WaitForPing;
 		break;
 	}
@@ -919,7 +920,7 @@ class VCoproc {
 	/* Map of in-progress pf entries. */
 	std::unordered_map<std::string, std::unique_ptr<PendingFile>> pending;
 
-	void FetchMoreFiles();
+	size_t FetchMoreFiles();
 	int FetchFilesFromDir(const std::string &dir,
 			      std::deque<std::string> &frontier, int &credits);
 	void PreProcessNewFiles();
@@ -1152,10 +1153,11 @@ VCoproc::~VCoproc()
 	}
 }
 
-void
+size_t
 VCoproc::FetchMoreFiles()
 {
 	int credits = max_pending;
+	size_t num  = 0;
 
 	assert(input_dir_idx < input_dirs.size());
 
@@ -1175,21 +1177,29 @@ VCoproc::FetchMoreFiles()
 		for (int c = 0; !frontier.empty() && credits > 0 && c < 32;
 		     c++) {
 			std::string &dir = frontier.front();
+			int ret;
 
-			FetchFilesFromDir(dir, frontier, credits);
+			ret = FetchFilesFromDir(dir, frontier, credits);
+			if (ret > 0) {
+				num += ret;
+			}
 			frontier.pop_front();
 		}
 		if (++input_dir_idx >= input_dirs.size()) {
 			input_dir_idx = 0;
 		}
 	}
+
+	return num;
 }
 
+/* On success, this function returns the number of new files found. */
 int
 VCoproc::FetchFilesFromDir(const std::string &dirname,
 			   std::deque<std::string> &frontier, int &credits)
 {
 	struct dirent *dent;
+	int ret = 0;
 	DIR *dir;
 
 	dir = opendir(dirname.c_str());
@@ -1292,13 +1302,14 @@ VCoproc::FetchFilesFromDir(const std::string &dirname,
 				std::cout << logb(LogDbg) << "New file " << path
 					  << std::endl;
 			}
+			ret++; /* increment file count */
 		}
 		credits--;
 	}
 
 	closedir(dir);
 
-	return 0;
+	return ret;
 }
 
 void
@@ -1710,11 +1721,68 @@ VCoproc::MainLoop()
 	int err = 0;
 
 	while (!bail_out) {
+		CURLMcode cm;
+
 		/*
 		 * Refill the pending table by fetching more
 		 * files from the input directories.
 		 */
-		FetchMoreFiles();
+		size_t new_files = FetchMoreFiles();
+
+		/*
+		 * When there are no more files to be processed
+		 * or pending activities, stop if we are not in
+		 * monitor mode.
+		 */
+		if (!monitor && new_files == 0 && num_running_curls == 0) {
+			bool all_complete = true;
+
+			for (auto &kv : pending) {
+				auto &pf = kv.second;
+
+				if (pf->State() != PendState::Complete) {
+					all_complete = false;
+					break;
+				}
+			}
+
+			if (all_complete) {
+				/* We can stop. */
+				break;
+			}
+		}
+
+		/*
+		 * Wait for any activity on CURL transfers or on the stop
+		 * file descriptor. We set a non-zero timeout if there are
+		 * in-progress CURL transfers or we run out of new files.
+		 * Otherwise it means that there are no in-progress transfers
+		 * and there are new files: in that case we set a zero timeout
+		 * because we just want to check the stop file descriptor.
+		 */
+		int timeout_ms =
+		    (num_running_curls > 0 || new_files == 0) ? 5000 : 0;
+		struct curl_waitfd wfd[1];
+		wfd[0].fd      = stopfd;
+		wfd[0].events  = CURL_WAIT_POLLIN;
+		wfd[0].revents = 0;
+		cm	       = curl_multi_wait(curlm, wfd, 1, timeout_ms,
+					 /*&numfds=*/NULL);
+		if (cm != CURLM_OK) {
+			std::cerr << "Failed to wait multi handle: "
+				  << curl_multi_strerror(cm) << std::endl;
+			break;
+		}
+
+		if (wfd[0].revents & CURL_WAIT_POLLIN) {
+			/* We got a signal asking us to stop. */
+			EventFdDrain(stopfd);
+			if (verbose) {
+				std::cout << "Stopping the event loop"
+					  << std::endl;
+			}
+			break;
+		}
 
 		/* Scan any new entries and carry out some
 		 * pre-processing. */
@@ -1729,7 +1797,7 @@ VCoproc::MainLoop()
 
 		/* Submit or advance any pending POST transfers.
 		 */
-		CURLMcode cm = curl_multi_perform(curlm, &num_running_curls);
+		cm = curl_multi_perform(curlm, &num_running_curls);
 		if (cm != CURLM_OK) {
 			std::cerr << "Failed to perform multi "
 				     "handle: "
@@ -1800,63 +1868,6 @@ VCoproc::MainLoop()
 
 		/* Update the statistics if necessary. */
 		UpdateStatistics();
-
-		/*
-		 * When there are no more files to be processed
-		 * or pending activities, stop if we are not in
-		 * monitor mode.
-		 */
-		if (!monitor && num_running_curls == 0) {
-			bool all_complete = true;
-
-			for (auto &kv : pending) {
-				auto &pf = kv.second;
-
-				if (pf->State() != PendState::Complete) {
-					all_complete = false;
-					break;
-				}
-			}
-
-			if (all_complete) {
-				break;
-			}
-		}
-
-		/* TODO document the timeout_ms/progress logic
-		 */
-		int timeout_ms =
-		    (progress > 0 && num_running_curls == 0) ? 0 : 5000;
-
-		if (num_running_curls == 0) {
-			progress = 0;
-		}
-
-		/*
-		 * Wait for any activity on POST transfers or on
-		 * the stop file descriptor.
-		 */
-		struct curl_waitfd wfd[1];
-		wfd[0].fd      = stopfd;
-		wfd[0].events  = CURL_WAIT_POLLIN;
-		wfd[0].revents = 0;
-		cm	       = curl_multi_wait(curlm, wfd, 1, timeout_ms,
-					 /*&numfds=*/NULL);
-		if (cm != CURLM_OK) {
-			std::cerr << "Failed to wait multi handle: "
-				  << curl_multi_strerror(cm) << std::endl;
-			break;
-		}
-
-		if (wfd[0].revents & CURL_WAIT_POLLIN) {
-			/* We got a signal asking us to stop. */
-			EventFdDrain(stopfd);
-			if (verbose) {
-				std::cout << "Stopping the event loop"
-					  << std::endl;
-			}
-			break;
-		}
 	}
 
 	UpdateStatistics(/*force=*/true);
