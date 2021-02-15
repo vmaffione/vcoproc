@@ -48,6 +48,9 @@ Usage(const char *progname)
 	    << std::endl
 	    << "    -f FORWARD_DIR (directory where to move processed files)"
 	    << std::endl
+	    << "    -a ARCHIVE_DIR (directory where to archive processed wav "
+	       "files)"
+	    << std::endl
 	    << "    -D DB_FILE (path to the sqlite3 database file)" << std::endl
 	    << "    -c (consume input files)" << std::endl
 	    << "    -m (monitor input directories rather than stop when "
@@ -869,6 +872,7 @@ class VCoproc {
 	std::string output_dir;
 	std::string failed_dir;
 	std::string forward_dir;
+	std::string archive_dir;
 
 	/*
 	 * Max number of entries that we allow in the pending table
@@ -942,17 +946,17 @@ class VCoproc {
 	    std::string source, std::vector<std::string> input_dirs,
 	    std::vector<std::string> input_exts, std::string output_dir,
 	    std::string failed_dir, std::string forward_dir,
-	    unsigned short max_pending, std::string dbfile, std::string host,
-	    unsigned short port);
+	    std::string archive_dir, unsigned short max_pending,
+	    std::string dbfile, std::string host, unsigned short port);
 
 	VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend>, int verbose,
 		bool consume, bool monitor, std::string source,
 		std::vector<std::string> input_dirs,
 		std::vector<std::string> input_exts, std::string output_dir,
 		std::string failed_dir, std::string forward_dir,
-		unsigned short max_pending, std::string dbfile,
-		std::unique_ptr<SQLiteDbConn> dbconn, std::string host,
-		unsigned short port);
+		std::string archive_dir, unsigned short max_pending,
+		std::string dbfile, std::unique_ptr<SQLiteDbConn> dbconn,
+		std::string host, unsigned short port);
 	~VCoproc();
 	int MainLoop();
 };
@@ -962,8 +966,8 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		std::string source, std::vector<std::string> input_dirs,
 		std::vector<std::string> input_exts, std::string output_dir,
 		std::string failed_dir, std::string forward_dir,
-		unsigned short max_pending, std::string dbfile,
-		std::string host, unsigned short port)
+		std::string archive_dir, unsigned short max_pending,
+		std::string dbfile, std::string host, unsigned short port)
 {
 	if (source.empty()) {
 		std::cerr << logb(LogErr) << "No source/origin specified"
@@ -1097,8 +1101,8 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 	    stopfd, curlm, std::move(be), verbose, consume, monitor,
 	    std::move(source), std::move(input_dirs), std::move(input_exts),
 	    std::move(output_dir), std::move(failed_dir),
-	    std::move(forward_dir), max_pending, std::move(dbfile),
-	    std::move(dbconn), std::move(host), port);
+	    std::move(forward_dir), std::move(archive_dir), max_pending,
+	    std::move(dbfile), std::move(dbconn), std::move(host), port);
 }
 
 VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
@@ -1106,9 +1110,9 @@ VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
 		 std::vector<std::string> input_dirs,
 		 std::vector<std::string> input_exts, std::string output_dir,
 		 std::string failed_dir, std::string forward_dir,
-		 unsigned short max_pending, std::string dbfile,
-		 std::unique_ptr<SQLiteDbConn> dbconn, std::string host,
-		 unsigned short port)
+		 std::string archive_dir, unsigned short max_pending,
+		 std::string dbfile, std::unique_ptr<SQLiteDbConn> dbconn,
+		 std::string host, unsigned short port)
     : stopfd(stopfd),
       curlm(curlm),
       be(std::move(be)),
@@ -1121,6 +1125,7 @@ VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
       output_dir(std::move(output_dir)),
       failed_dir(std::move(failed_dir)),
       forward_dir(std::move(forward_dir)),
+      archive_dir(std::move(archive_dir)),
       max_pending(max_pending),
       dbfile(std::move(dbfile)),
       dbconn(std::move(dbconn)),
@@ -1529,11 +1534,12 @@ void
 VCoproc::PostProcessFiles()
 {
 	bool forward = !forward_dir.empty();
+	bool archive = !archive_dir.empty();
 
 	for (auto &kv : pending) {
-		bool remove, copy, move, copymove, success, failure;
+		std::vector<std::string> dstdirs;
+		bool success, failure;
 		auto &pf = kv.second;
-		std::string dstdir;
 
 		success = pf->State() == PendState::ProcSuccess;
 		failure = pf->State() == PendState::ProcFailure;
@@ -1542,39 +1548,55 @@ VCoproc::PostProcessFiles()
 			continue;
 		}
 
-		remove	 = success && consume && !forward;
-		copymove = failure || (success && forward);
-		copy	 = copymove && !consume;
-		move	 = copymove && consume;
-		dstdir	 = failure ? failed_dir : forward_dir;
+		/*
+		 * Build a list of destination directories we want to
+		 * copy or move the file to.
+		 */
+		if (failure) {
+			dstdirs.push_back(failed_dir);
+		}
+		if (success && forward) {
+			dstdirs.push_back(forward_dir);
+		}
+		if (success && archive) {
+			dstdirs.push_back(archive_dir);
+		}
 
-		if (remove) {
+		/*
+		 * No destination directories and we need to consume.
+		 * Just remove the file.
+		 */
+		if (dstdirs.empty() && consume) {
 			if (RemoveFile(pf->FilePath())) {
 				bail_out = true;
 			} else if (verbose) {
 				std::cout << logb(LogDbg) << "Removed "
 					  << pf->FilePath() << std::endl;
 			}
+		}
 
-		} else if (move) {
-			if (MoveToDir(dstdir, pf->FilePath())) {
-				bail_out = true;
-			} else if (verbose) {
-				std::cout << logb(LogDbg) << "Moved "
-					  << pf->FilePath() << " --> " << dstdir
-					  << std::endl;
-			}
-
-		} else if (copy) {
-			if (CopyToDir(dstdir, pf->FilePath())) {
+		/*
+		 * If we have some destination directories, copy the file
+		 * to them. If we need to consume the file, perform a final
+		 * file move to the first destination.
+		 */
+		for (size_t i = !!consume; i < dstdirs.size(); i++) {
+			if (CopyToDir(dstdirs[i], pf->FilePath())) {
 				bail_out = true;
 			} else if (verbose) {
 				std::cout << logb(LogDbg) << "Copied "
-					  << pf->FilePath() << " --> " << dstdir
-					  << std::endl;
+					  << pf->FilePath() << " --> "
+					  << dstdirs[i] << std::endl;
 			}
-		} else {
-			/* success && !consume && !forward */
+		}
+		if (!dstdirs.empty() && consume) {
+			if (MoveToDir(dstdirs[0], pf->FilePath())) {
+				bail_out = true;
+			} else if (verbose) {
+				std::cout << logb(LogDbg) << "Moved "
+					  << pf->FilePath() << " --> "
+					  << dstdirs[0] << std::endl;
+			}
 		}
 
 		stats.files_completed++;
@@ -1907,6 +1929,7 @@ main(int argc, char **argv)
 	std::string output_dir;
 	std::string failed_dir;
 	std::string forward_dir;
+	std::string archive_dir;
 	std::string dbfile;
 	std::string source;
 	std::string host;
@@ -1951,7 +1974,8 @@ main(int argc, char **argv)
 		return ret;
 	}
 
-	while ((opt = getopt(argc, argv, "hVvi:o:F:f:cmD:H:p:s:e:n:")) != -1) {
+	while ((opt = getopt(argc, argv, "hVvi:o:F:f:a:cmD:H:p:s:e:n:")) !=
+	       -1) {
 		switch (opt) {
 		case 'h':
 			Usage(argv[0]);
@@ -2015,6 +2039,16 @@ main(int argc, char **argv)
 			break;
 		}
 
+		case 'a':
+			if (!DirExists(optarg)) {
+				std::cerr << logb(LogErr) << "Directory "
+					  << optarg << " not found "
+					  << std::endl;
+				return -1;
+			}
+			archive_dir = std::string(optarg);
+			break;
+
 		case 'c':
 			consume = true;
 			break;
@@ -2069,8 +2103,8 @@ main(int argc, char **argv)
 	auto vcoproc = VCoproc::Create(
 	    stopfd_global, verbose, consume, monitor, std::move(source),
 	    std::move(input_dirs), std::move(input_exts), std::move(output_dir),
-	    std::move(failed_dir), std::move(forward_dir), max_pending, dbfile,
-	    host, port);
+	    std::move(failed_dir), std::move(forward_dir),
+	    std::move(archive_dir), max_pending, dbfile, host, port);
 	if (vcoproc == nullptr) {
 		return -1;
 	}
