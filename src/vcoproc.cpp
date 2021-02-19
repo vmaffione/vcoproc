@@ -1065,6 +1065,8 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		qss << "CREATE TABLE IF NOT EXISTS stats ("
 		    << "timestamp UNSIGNED INTEGER PRIMARY KEY "
 		       "NOT NULL, "
+		    << "diffseconds DOUBLE "
+		       "NOT NULL CHECK(diffseconds > 0.0), "
 		    << "files_scored UNSIGNED INTEGER NOT "
 		       "NULL, "
 		    << "bytes_scored UNSIGNED INTEGER NOT "
@@ -1640,13 +1642,14 @@ VCoproc::TimeoutWaitingRequests()
 int
 VCoproc::UpdateStatistics(bool force = false)
 {
+	float diff_seconds = SecsElapsed(stats_start);
 	std::stringstream qss;
 
-	if (!force && SecsElapsed(stats_start) < stats_period) {
+	if (!force && diff_seconds < stats_period) {
 		return 0;
 	}
 
-	qss << "INSERT INTO stats(timestamp, files_scored, "
+	qss << "INSERT INTO stats(timestamp, diffseconds, files_scored, "
 	       "bytes_scored, audiosec_scored, "
 	       "speechsec_scored, "
 	       "files_nomdata, bytes_nomdata, "
@@ -1656,13 +1659,14 @@ VCoproc::UpdateStatistics(bool force = false)
 	       "files_completed, bytes_completed, "
 	       "procsec_completed) "
 	       "VALUES(strftime('%s','now'), "
-	    << stats.files_scored << "," << stats.bytes_scored << ","
-	    << stats.audiosec_scored << "," << stats.speechsec_scored << ","
-	    << stats.files_nomdata << "," << stats.bytes_nomdata << ","
-	    << stats.audiosec_nomdata << "," << stats.files_failed << ","
-	    << stats.bytes_failed << "," << stats.files_timedout << ","
-	    << stats.bytes_timedout << "," << stats.files_completed << ","
-	    << stats.bytes_completed << "," << stats.procsec_completed << ")";
+	    << diff_seconds << "," << stats.files_scored << ","
+	    << stats.bytes_scored << "," << stats.audiosec_scored << ","
+	    << stats.speechsec_scored << "," << stats.files_nomdata << ","
+	    << stats.bytes_nomdata << "," << stats.audiosec_nomdata << ","
+	    << stats.files_failed << "," << stats.bytes_failed << ","
+	    << stats.files_timedout << "," << stats.bytes_timedout << ","
+	    << stats.files_completed << "," << stats.bytes_completed << ","
+	    << stats.procsec_completed << ")";
 	if (dbconn->ModifyStmt(qss, verbose)) {
 		return -1;
 	}
