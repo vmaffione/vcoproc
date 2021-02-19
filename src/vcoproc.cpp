@@ -665,7 +665,7 @@ class PsBackendTransaction : public BackendTransaction {
 		WaitForProcess = 3,
 		Finished       = 4,
 	};
-#if 1
+#if 0
 	State state = State::Init;
 #else
 	State state = State::ReadyToProcess;
