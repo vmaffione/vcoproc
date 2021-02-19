@@ -59,6 +59,9 @@ Usage(const char *progname)
 	    << "    -n MAX_PENDING_TRANSACTIONS (max number of concurrent "
 	       "processing transactions)"
 	    << std::endl
+	    << "    -T STATS_PERIOD (how often to update statistics, in "
+	       "seconds)"
+	    << std::endl
 	    << "    -H BACKEND_HOST (address or name of the backend engine)"
 	    << std::endl
 	    << "    -p BACKEND_PORT (TCP port of the backend engine)"
@@ -880,6 +883,9 @@ class VCoproc {
 	 */
 	unsigned short max_pending = 5;
 
+	/* Statistics update period in seconds. */
+	unsigned int stats_period = 300;
+
 	std::string dbfile;
 	std::unique_ptr<SQLiteDbConn> dbconn;
 	std::string host;
@@ -947,7 +953,8 @@ class VCoproc {
 	    std::vector<std::string> input_exts, std::string output_dir,
 	    std::string failed_dir, std::string forward_dir,
 	    std::string archive_dir, unsigned short max_pending,
-	    std::string dbfile, std::string host, unsigned short port);
+	    unsigned int stats_period, std::string dbfile, std::string host,
+	    unsigned short port);
 
 	VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend>, int verbose,
 		bool consume, bool monitor, std::string source,
@@ -955,8 +962,9 @@ class VCoproc {
 		std::vector<std::string> input_exts, std::string output_dir,
 		std::string failed_dir, std::string forward_dir,
 		std::string archive_dir, unsigned short max_pending,
-		std::string dbfile, std::unique_ptr<SQLiteDbConn> dbconn,
-		std::string host, unsigned short port);
+		unsigned int stats_period, std::string dbfile,
+		std::unique_ptr<SQLiteDbConn> dbconn, std::string host,
+		unsigned short port);
 	~VCoproc();
 	int MainLoop();
 };
@@ -967,7 +975,8 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		std::vector<std::string> input_exts, std::string output_dir,
 		std::string failed_dir, std::string forward_dir,
 		std::string archive_dir, unsigned short max_pending,
-		std::string dbfile, std::string host, unsigned short port)
+		unsigned int stats_period, std::string dbfile, std::string host,
+		unsigned short port)
 {
 	if (source.empty()) {
 		std::cerr << logb(LogErr) << "No source/origin specified"
@@ -1001,6 +1010,12 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		std::cerr << logb(LogErr)
 			  << "Number of max pending "
 			     "transactions out of range"
+			  << std::endl;
+		return nullptr;
+	}
+
+	if (stats_period < 5 || stats_period > 10000) {
+		std::cerr << logb(LogErr) << "Stats period out of range"
 			  << std::endl;
 		return nullptr;
 	}
@@ -1042,19 +1057,8 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		return nullptr;
 	}
 
-	/* Create the proc and stats tables if they do not exist
+	/* Create the stats table if it does not exist
 	 * already. */
-	{
-		std::stringstream qss;
-		qss << "CREATE TABLE IF NOT EXISTS proc ("
-		    << "src_path VARCHAR(255) PRIMARY KEY NOT "
-		       "NULL, "
-		    << "state TINYINT NOT NULL, "
-		    << "mjson TEXT)";
-		if (dbconn->ModifyStmt(qss, verbose)) {
-			return nullptr;
-		}
-	}
 	{
 		std::stringstream qss;
 		qss << "CREATE TABLE IF NOT EXISTS stats ("
@@ -1102,7 +1106,8 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 	    std::move(source), std::move(input_dirs), std::move(input_exts),
 	    std::move(output_dir), std::move(failed_dir),
 	    std::move(forward_dir), std::move(archive_dir), max_pending,
-	    std::move(dbfile), std::move(dbconn), std::move(host), port);
+	    stats_period, std::move(dbfile), std::move(dbconn), std::move(host),
+	    port);
 }
 
 VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
@@ -1111,8 +1116,9 @@ VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
 		 std::vector<std::string> input_exts, std::string output_dir,
 		 std::string failed_dir, std::string forward_dir,
 		 std::string archive_dir, unsigned short max_pending,
-		 std::string dbfile, std::unique_ptr<SQLiteDbConn> dbconn,
-		 std::string host, unsigned short port)
+		 unsigned int stats_period, std::string dbfile,
+		 std::unique_ptr<SQLiteDbConn> dbconn, std::string host,
+		 unsigned short port)
     : stopfd(stopfd),
       curlm(curlm),
       be(std::move(be)),
@@ -1127,6 +1133,7 @@ VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
       forward_dir(std::move(forward_dir)),
       archive_dir(std::move(archive_dir)),
       max_pending(max_pending),
+      stats_period(stats_period),
       dbfile(std::move(dbfile)),
       dbconn(std::move(dbconn)),
       host(std::move(host)),
@@ -1633,7 +1640,7 @@ VCoproc::UpdateStatistics(bool force = false)
 {
 	std::stringstream qss;
 
-	if (!force && SecsElapsed(stats_start) < 2) {
+	if (!force && SecsElapsed(stats_start) < stats_period) {
 		return 0;
 	}
 
@@ -1926,6 +1933,7 @@ main(int argc, char **argv)
 	std::vector<std::string> input_dirs;
 	std::vector<std::string> input_exts;
 	unsigned short max_pending = 5;
+	unsigned int stats_period  = 300;
 	std::string output_dir;
 	std::string failed_dir;
 	std::string forward_dir;
@@ -1974,7 +1982,7 @@ main(int argc, char **argv)
 		return ret;
 	}
 
-	while ((opt = getopt(argc, argv, "hVvi:o:F:f:a:cmD:H:p:s:e:n:")) !=
+	while ((opt = getopt(argc, argv, "hVvi:o:F:f:a:cmD:H:p:s:e:n:T:")) !=
 	       -1) {
 		switch (opt) {
 		case 'h':
@@ -2066,6 +2074,15 @@ main(int argc, char **argv)
 			}
 			break;
 
+		case 'T':
+			if (!Str2Num<unsigned int>(optarg, stats_period)) {
+				std::cerr << logb(LogErr)
+					  << "Invalid value for -T: " << optarg
+					  << std::endl;
+				return -1;
+			}
+			break;
+
 		case 'D':
 			dbfile = std::string(optarg);
 			break;
@@ -2104,7 +2121,8 @@ main(int argc, char **argv)
 	    stopfd_global, verbose, consume, monitor, std::move(source),
 	    std::move(input_dirs), std::move(input_exts), std::move(output_dir),
 	    std::move(failed_dir), std::move(forward_dir),
-	    std::move(archive_dir), max_pending, dbfile, host, port);
+	    std::move(archive_dir), max_pending, stats_period, dbfile, host,
+	    port);
 	if (vcoproc == nullptr) {
 		return -1;
 	}
