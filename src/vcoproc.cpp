@@ -62,6 +62,9 @@ Usage(const char *progname)
 	    << "    -T STATS_PERIOD (how often to update statistics, in "
 	       "seconds)"
 	    << std::endl
+	    << "    -R RETENTION_DAYS (how long to keep statistics, "
+	       "in days)"
+	    << std::endl
 	    << "    -H BACKEND_HOST (address or name of the backend engine)"
 	    << std::endl
 	    << "    -p BACKEND_PORT (TCP port of the backend engine)"
@@ -884,8 +887,11 @@ class VCoproc {
 	 */
 	unsigned short max_pending = 5;
 
-	/* Statistics update period in seconds. */
-	unsigned int stats_period = 300;
+	/*
+	 * Statistics update period in seconds, and retention days.
+	 */
+	unsigned int stats_period   = 300;
+	unsigned int retention_days = 7;
 
 	std::string dbfile;
 	std::unique_ptr<SQLiteDbConn> dbconn;
@@ -954,8 +960,8 @@ class VCoproc {
 	    std::vector<std::string> input_exts, std::string output_dir,
 	    std::string failed_dir, std::string forward_dir,
 	    std::string archive_dir, unsigned short max_pending,
-	    unsigned int stats_period, std::string dbfile, std::string host,
-	    unsigned short port);
+	    unsigned int stats_period, unsigned int retention_days,
+	    std::string dbfile, std::string host, unsigned short port);
 
 	VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend>, int verbose,
 		bool consume, bool monitor, std::string source,
@@ -963,9 +969,9 @@ class VCoproc {
 		std::vector<std::string> input_exts, std::string output_dir,
 		std::string failed_dir, std::string forward_dir,
 		std::string archive_dir, unsigned short max_pending,
-		unsigned int stats_period, std::string dbfile,
-		std::unique_ptr<SQLiteDbConn> dbconn, std::string host,
-		unsigned short port);
+		unsigned int stats_period, unsigned int retention_days,
+		std::string dbfile, std::unique_ptr<SQLiteDbConn> dbconn,
+		std::string host, unsigned short port);
 	~VCoproc();
 	int MainLoop();
 };
@@ -976,8 +982,8 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		std::vector<std::string> input_exts, std::string output_dir,
 		std::string failed_dir, std::string forward_dir,
 		std::string archive_dir, unsigned short max_pending,
-		unsigned int stats_period, std::string dbfile, std::string host,
-		unsigned short port)
+		unsigned int stats_period, unsigned int retention_days,
+		std::string dbfile, std::string host, unsigned short port)
 {
 	if (source.empty()) {
 		std::cerr << logb(LogErr) << "No source/origin specified"
@@ -1017,6 +1023,12 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 
 	if (stats_period < 5 || stats_period > 10000) {
 		std::cerr << logb(LogErr) << "Stats period out of range"
+			  << std::endl;
+		return nullptr;
+	}
+
+	if (retention_days < 1 || retention_days > 10000) {
+		std::cerr << logb(LogErr) << "Retention days out of range"
 			  << std::endl;
 		return nullptr;
 	}
@@ -1109,8 +1121,8 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 	    std::move(source), std::move(input_dirs), std::move(input_exts),
 	    std::move(output_dir), std::move(failed_dir),
 	    std::move(forward_dir), std::move(archive_dir), max_pending,
-	    stats_period, std::move(dbfile), std::move(dbconn), std::move(host),
-	    port);
+	    stats_period, retention_days, std::move(dbfile), std::move(dbconn),
+	    std::move(host), port);
 }
 
 VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
@@ -1119,9 +1131,9 @@ VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
 		 std::vector<std::string> input_exts, std::string output_dir,
 		 std::string failed_dir, std::string forward_dir,
 		 std::string archive_dir, unsigned short max_pending,
-		 unsigned int stats_period, std::string dbfile,
-		 std::unique_ptr<SQLiteDbConn> dbconn, std::string host,
-		 unsigned short port)
+		 unsigned int stats_period, unsigned int retention_days,
+		 std::string dbfile, std::unique_ptr<SQLiteDbConn> dbconn,
+		 std::string host, unsigned short port)
     : stopfd(stopfd),
       curlm(curlm),
       be(std::move(be)),
@@ -1137,6 +1149,7 @@ VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
       archive_dir(std::move(archive_dir)),
       max_pending(max_pending),
       stats_period(stats_period),
+      retention_days(retention_days),
       dbfile(std::move(dbfile)),
       dbconn(std::move(dbconn)),
       host(std::move(host)),
@@ -1671,6 +1684,14 @@ VCoproc::UpdateStatistics(bool force = false)
 		return -1;
 	}
 
+	/* Apply the retention policy to the stats table. */
+	time_t retention_t = time(nullptr);
+
+	retention_t -= retention_days * 24 * 60 * 60;
+	qss = std::stringstream();
+	qss << "DELETE FROM stats WHERE timestamp < " << retention_t;
+	dbconn->ModifyStmt(qss, verbose);
+
 	stats_start = std::chrono::system_clock::now();
 	stats	    = {};
 
@@ -1938,8 +1959,9 @@ main(int argc, char **argv)
 {
 	std::vector<std::string> input_dirs;
 	std::vector<std::string> input_exts;
-	unsigned short max_pending = 5;
-	unsigned int stats_period  = 300;
+	unsigned short max_pending  = 5;
+	unsigned int stats_period   = 300;
+	unsigned int retention_days = 7;
 	std::string output_dir;
 	std::string failed_dir;
 	std::string forward_dir;
@@ -1988,7 +2010,7 @@ main(int argc, char **argv)
 		return ret;
 	}
 
-	while ((opt = getopt(argc, argv, "hVvi:o:F:f:a:cmD:H:p:s:e:n:T:")) !=
+	while ((opt = getopt(argc, argv, "hVvi:o:F:f:a:cmD:H:p:s:e:n:T:R:")) !=
 	       -1) {
 		switch (opt) {
 		case 'h':
@@ -2089,6 +2111,15 @@ main(int argc, char **argv)
 			}
 			break;
 
+		case 'R':
+			if (!Str2Num<unsigned int>(optarg, retention_days)) {
+				std::cerr << logb(LogErr)
+					  << "Invalid value for -R: " << optarg
+					  << std::endl;
+				return -1;
+			}
+			break;
+
 		case 'D':
 			dbfile = std::string(optarg);
 			break;
@@ -2127,8 +2158,8 @@ main(int argc, char **argv)
 	    stopfd_global, verbose, consume, monitor, std::move(source),
 	    std::move(input_dirs), std::move(input_exts), std::move(output_dir),
 	    std::move(failed_dir), std::move(forward_dir),
-	    std::move(archive_dir), max_pending, stats_period, dbfile, host,
-	    port);
+	    std::move(archive_dir), max_pending, stats_period, retention_days,
+	    dbfile, host, port);
 	if (vcoproc == nullptr) {
 		return -1;
 	}
