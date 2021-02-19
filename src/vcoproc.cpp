@@ -399,6 +399,7 @@ class PendingFile {
 	std::string StateStr() const;
 	void SetState(PendState state);
 	std::string FilePath() const { return src_path; }
+	std::string FileName() const { return FileBaseName(src_path); }
 	size_t FileSize() const { return src_size; }
 	static std::unique_ptr<PendingFile> Create(
 	    std::unique_ptr<BackendTransaction> bt, CURLM *curlm,
@@ -1309,7 +1310,8 @@ VCoproc::FetchFilesFromDir(const std::string &dirname,
 			    std::move(be->CreateTransaction(path)), curlm, path,
 			    verbose));
 			if (verbose) {
-				std::cout << logb(LogDbg) << "New file " << path
+				std::cout << logb(LogDbg) << "New file "
+					  << pending[path]->FileName()
 					  << std::endl;
 			}
 			ret++; /* increment file count */
@@ -1449,7 +1451,7 @@ VCoproc::RetireAndProcessPostResponses()
 
 		if (verbose) {
 			std::cout << logb(LogDbg) << "Processed "
-				  << pf->FilePath() << " --> " << http_code
+				  << pf->FileName() << " --> " << http_code
 				  << " " << json11::Json(pf->jout).dump()
 				  << std::endl;
 		}
@@ -1474,7 +1476,7 @@ VCoproc::RetireAndProcessPostResponses()
 
 		if (success) {
 			/* Output JSON. */
-			std::string jsname = FileBaseName(pf->FilePath());
+			std::string jsname = pf->FileName();
 			std::string jspath;
 
 			pf->jout["origin"] = source;
@@ -1527,7 +1529,7 @@ VCoproc::CleanupCompletedFiles()
 		if (pf->State() == PendState::Complete && consume) {
 			if (verbose) {
 				std::cout << logb(LogDbg) << "Completed "
-					  << pf->FilePath() << std::endl;
+					  << pf->FileName() << std::endl;
 			}
 			it = pending.erase(it);
 			progress++;
@@ -1578,7 +1580,7 @@ VCoproc::PostProcessFiles()
 				bail_out = true;
 			} else if (verbose) {
 				std::cout << logb(LogDbg) << "Removed "
-					  << pf->FilePath() << std::endl;
+					  << pf->FileName() << std::endl;
 			}
 		}
 
@@ -1592,7 +1594,7 @@ VCoproc::PostProcessFiles()
 				bail_out = true;
 			} else if (verbose) {
 				std::cout << logb(LogDbg) << "Copied "
-					  << pf->FilePath() << " --> "
+					  << pf->FileName() << " --> "
 					  << dstdirs[i] << std::endl;
 			}
 		}
@@ -1601,7 +1603,7 @@ VCoproc::PostProcessFiles()
 				bail_out = true;
 			} else if (verbose) {
 				std::cout << logb(LogDbg) << "Moved "
-					  << pf->FilePath() << " --> "
+					  << pf->FileName() << " --> "
 					  << dstdirs[0] << std::endl;
 			}
 		}
@@ -1625,7 +1627,7 @@ VCoproc::TimeoutWaitingRequests()
 		    pf->InactivitySeconds() > 120.0) {
 			pf->SetState(PendState::ProcFailure);
 			progress++;
-			std::cerr << logb(LogErr) << "File " << pf->FilePath()
+			std::cerr << logb(LogErr) << "File " << pf->FileName()
 				  << " timed out" << std::endl;
 			stats.files_failed++;
 			stats.bytes_failed += pf->FileSize();
@@ -1734,8 +1736,8 @@ VCoproc::DumpPendingTable() const
 	for (const auto &kv : pending) {
 		const auto &pf = kv.second;
 
-		std::cout << "    " << FileBaseName(pf->FilePath()) << ": "
-			  << pf->StateStr() << std::endl;
+		std::cout << "    " << pf->FileName() << ": " << pf->StateStr()
+			  << std::endl;
 	}
 	std::cout << "===============================" << std::endl;
 }
