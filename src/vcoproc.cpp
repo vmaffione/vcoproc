@@ -321,8 +321,7 @@ class BackendTransaction {
 
 class Backend {
     public:
-	virtual bool Probe()		    = 0;
-	virtual std::string BaseUrl() const = 0;
+	virtual bool Probe() = 0;
 	virtual std::unique_ptr<BackendTransaction> CreateTransaction(
 	    const std::string &filepath) = 0;
 };
@@ -658,8 +657,23 @@ PendingFile::RetirePostCurl(std::string &respstr)
 	return 0;
 }
 
+class PsBackend : public Backend {
+	std::string int_url;
+	std::string bat_url;
+
+    public:
+	static std::unique_ptr<Backend> Create(std::string host,
+					       unsigned short port);
+	PsBackend(std::string host, unsigned short port);
+	virtual bool Probe();
+	std::unique_ptr<BackendTransaction> CreateTransaction(
+	    const std::string &filepath);
+	std::string InteractiveURL() const { return int_url; }
+	std::string BatchURL() const { return bat_url; }
+};
+
 class PsBackendTransaction : public BackendTransaction {
-	Backend *be = nullptr;
+	PsBackend *be = nullptr;
 	std::string filepath;
 	enum class State {
 		Init	       = 0,
@@ -676,8 +690,9 @@ class PsBackendTransaction : public BackendTransaction {
 
     public:
 	PsBackendTransaction(Backend *be, const std::string &filepath)
-	    : be(be), filepath(filepath)
+	    : be(dynamic_cast<PsBackend *>(be)), filepath(filepath)
 	{
+		assert(this->be != nullptr);
 	}
 	int PrepareRequest(std::string &url, std::string &req);
 	int ProcessResponse(std::string &resp, json11::Json::object &jout);
@@ -690,13 +705,13 @@ PsBackendTransaction::PrepareRequest(std::string &url, std::string &req)
 
 	switch (state) {
 	case State::Init: {
-		url   = be->BaseUrl() + "/ping";
+		url   = be->InteractiveURL() + "/ping";
 		state = State::WaitForPing;
 		break;
 	}
 
 	case State::ReadyToProcess: {
-		url   = be->BaseUrl() + "/process";
+		url   = be->BatchURL() + "/process";
 		jsreq = json11::Json::object{
 		    {"file_name", filepath},
 		};
@@ -755,35 +770,28 @@ PsBackendTransaction::ProcessResponse(std::string &resp,
 	return 0;
 }
 
-class PsBackend : public Backend {
-	std::string base_url;
-
-    public:
-	static std::unique_ptr<Backend> Create(std::string host,
-					       unsigned short port);
-	PsBackend(std::string base_url);
-	virtual bool Probe();
-	std::string BaseUrl() const { return base_url; }
-	std::unique_ptr<BackendTransaction> CreateTransaction(
-	    const std::string &filepath);
-};
-
 std::unique_ptr<Backend>
 PsBackend::Create(std::string host, unsigned short port)
 {
-	std::stringstream base_url;
-
-	base_url << "http://" << host << ":" << port;
-
-	return std::make_unique<PsBackend>(base_url.str());
+	return std::make_unique<PsBackend>(host, port);
 }
 
-PsBackend::PsBackend(std::string base_url) : base_url(base_url) {}
+PsBackend::PsBackend(std::string host, unsigned short port)
+{
+	std::stringstream ss;
+
+	ss << "http://" << host << ":" << port;
+	int_url = ss.str();
+
+	ss = std::stringstream();
+	ss << "http://" << host << ":" << port + 1;
+	bat_url = ss.str();
+}
 
 bool
 PsBackend::Probe()
 {
-	std::string url = base_url + std::string("/ping");
+	std::string url = InteractiveURL() + std::string("/ping");
 	long http_code	= 0;
 	CURLcode cc;
 	CURL *curl;
@@ -992,8 +1000,8 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 	}
 
 	if (input_dirs.empty()) {
-		std::cerr << logb(LogErr) << "No input directories specified (-i)"
-			  << std::endl;
+		std::cerr << logb(LogErr)
+			  << "No input directories specified (-i)" << std::endl;
 		return nullptr;
 	}
 
@@ -1002,14 +1010,14 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 	}
 
 	if (output_dir.empty()) {
-		std::cerr << logb(LogErr) << "No output directory specified (-o)"
-			  << std::endl;
+		std::cerr << logb(LogErr)
+			  << "No output directory specified (-o)" << std::endl;
 		return nullptr;
 	}
 
 	if (failed_dir.empty()) {
-		std::cerr << logb(LogErr) << "No failed directory specified (-F)"
-			  << std::endl;
+		std::cerr << logb(LogErr)
+			  << "No failed directory specified (-F)" << std::endl;
 		return nullptr;
 	}
 
@@ -1046,7 +1054,8 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 	}
 
 	if (port == 0) {
-		std::cerr << logb(LogErr) << "No port specified (-p)" << std::endl;
+		std::cerr << logb(LogErr) << "No port specified (-p)"
+			  << std::endl;
 		return nullptr;
 	}
 
@@ -1811,8 +1820,7 @@ int
 VCoproc::MainLoop()
 {
 	int num_running_curls = 0;
-	std::string base_url;
-	int err = 0;
+	int err		      = 0;
 
 	while (!bail_out) {
 		CURLMcode cm;

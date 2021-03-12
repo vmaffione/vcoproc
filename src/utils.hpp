@@ -13,11 +13,10 @@
 
 namespace utils {
 
-enum {
-	LogErr = 0,
-	LogWrn,
-	LogInf,
-	LogDbg,
+enum { LogErr = 0,
+       LogWrn,
+       LogInf,
+       LogDbg,
 };
 
 bool DirExists(const char *path);
