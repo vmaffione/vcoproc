@@ -986,13 +986,13 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		std::string dbfile, std::string host, unsigned short port)
 {
 	if (source.empty()) {
-		std::cerr << logb(LogErr) << "No source/origin specified"
+		std::cerr << logb(LogErr) << "No source/origin specified (-s)"
 			  << std::endl;
 		return nullptr;
 	}
 
 	if (input_dirs.empty()) {
-		std::cerr << logb(LogErr) << "No input directories specified"
+		std::cerr << logb(LogErr) << "No input directories specified (-i)"
 			  << std::endl;
 		return nullptr;
 	}
@@ -1002,13 +1002,13 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 	}
 
 	if (output_dir.empty()) {
-		std::cerr << logb(LogErr) << "No output directory specified"
+		std::cerr << logb(LogErr) << "No output directory specified (-o)"
 			  << std::endl;
 		return nullptr;
 	}
 
 	if (failed_dir.empty()) {
-		std::cerr << logb(LogErr) << "No failed directory specified"
+		std::cerr << logb(LogErr) << "No failed directory specified (-F)"
 			  << std::endl;
 		return nullptr;
 	}
@@ -1034,19 +1034,19 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 	}
 
 	if (dbfile.empty()) {
-		std::cerr << logb(LogErr) << "No database file specified"
+		std::cerr << logb(LogErr) << "No database file specified (-D)"
 			  << std::endl;
 		return nullptr;
 	}
 
 	if (host.empty()) {
-		std::cerr << logb(LogErr) << "No hostname specified"
+		std::cerr << logb(LogErr) << "No hostname specified (-H)"
 			  << std::endl;
 		return nullptr;
 	}
 
 	if (port == 0) {
-		std::cerr << logb(LogErr) << "No port specified" << std::endl;
+		std::cerr << logb(LogErr) << "No port specified (-p)" << std::endl;
 		return nullptr;
 	}
 
