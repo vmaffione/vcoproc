@@ -1,9 +1,14 @@
 find_package(Threads REQUIRED)
 find_package(CURL REQUIRED)
-find_package(SQLite3 REQUIRED)
+#find_package(SQLite3 REQUIRED)
+find_library(SQLite3_LIBRARIES NAMES sqlite3)
+
+if (NOT SQLite3_LIBRARIES)
+	message(FATAL_ERROR "Could not find libsqlite3")
+endif()
 
 message(STATUS "CURL_LIBRARIES = ${CURL_LIBRARIES}")
-message(STATUS "SQLite3_LIBRARIES = ${SQLite3_LIBRARIES}")
+message(STATUS "SQLite3_LIBRARIES ${SQLite3_LIBRARIES}")
 include_directories(${CURL_INCLUDE_DIRS} ${SQLite3_INCLUDE_DIRS})
 add_executable(vcoproc vcoproc.cpp json11.cpp utils.cpp)
 target_link_libraries(vcoproc ${CMAKE_THREAD_LIBS_INIT} m ${CURL_LIBRARIES} ${SQLite3_LIBRARIES})
