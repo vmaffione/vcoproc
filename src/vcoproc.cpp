@@ -945,9 +945,18 @@ class VCoproc {
 	/* Map of in-progress pf entries. */
 	std::unordered_map<std::string, std::unique_ptr<PendingFile>> pending;
 
+	/* A pair (path, depth) useful for depth-limited DFS. */
+	struct DFSDir {
+		std::string path;
+		int depth = 0;
+		DFSDir(std::string p, int d = 0) : path(std::move(p)), depth(d)
+		{
+		}
+	};
+
 	size_t FetchMoreFiles();
-	int FetchFilesFromDir(const std::string &dir,
-			      std::deque<std::string> &frontier, int &credits);
+	int FetchFilesFromDir(const DFSDir &dfsdir,
+			      std::deque<DFSDir> &frontier, int &credits);
 	bool AnyPendingActivity(int num_running_curls) const;
 	bool AnyImmediateAction() const;
 	void PreProcessNewFiles();
@@ -1196,21 +1205,34 @@ VCoproc::FetchMoreFiles()
 		/*
 		 * Visit this input directory and all of its
 		 * input subdirectories (recursively). The visit
-		 * is implemented as a BFS (Breadth First
-		 * Search).
+		 * is implemented as a DFS (Depth First Search),
+		 * in such a way that we quickly get to the "leaves"
+		 * which are supposed to hold the audio files.
+		 * A BFS could spend most of the time trasversing
+		 * a large number of intermediate directories before
+		 * finding a single audio file.
+		 * We protect against file system loops by limiting
+		 * the DFS depth to a reasonable number.
 		 */
-		std::deque<std::string> frontier = {input_dirs[input_dir_idx]};
+		std::deque<DFSDir> frontier = {
+		    DFSDir(input_dirs[input_dir_idx])};
 
-		for (int c = 0; !frontier.empty() && credits > 0 && c < 32;
-		     c++) {
-			std::string &dir = frontier.front();
+		while (!frontier.empty() && credits > 0) {
+			DFSDir dfsdir = frontier.back();
 			int ret;
 
-			ret = FetchFilesFromDir(dir, frontier, credits);
+			frontier.pop_back();
+
+			if (dfsdir.depth >= 32) {
+				std::cout << "Possible loop detected at "
+					  << dfsdir.path << std::endl;
+				continue;
+			}
+
+			ret = FetchFilesFromDir(dfsdir, frontier, credits);
 			if (ret > 0) {
 				num += ret;
 			}
-			frontier.pop_front();
 		}
 		if (++input_dir_idx >= input_dirs.size()) {
 			input_dir_idx = 0;
@@ -1222,16 +1244,16 @@ VCoproc::FetchMoreFiles()
 
 /* On success, this function returns the number of new files found. */
 int
-VCoproc::FetchFilesFromDir(const std::string &dirname,
-			   std::deque<std::string> &frontier, int &credits)
+VCoproc::FetchFilesFromDir(const DFSDir &dfsdir, std::deque<DFSDir> &frontier,
+			   int &credits)
 {
 	struct dirent *dent;
 	int ret = 0;
 	DIR *dir;
 
-	dir = opendir(dirname.c_str());
+	dir = opendir(dfsdir.path.c_str());
 	if (dir == nullptr) {
-		std::cerr << logb(LogErr) << "Failed to opendir(" << dirname
+		std::cerr << logb(LogErr) << "Failed to opendir(" << dfsdir.path
 			  << "): " << strerror(errno) << std::endl;
 		return -1;
 	}
@@ -1259,7 +1281,7 @@ VCoproc::FetchFilesFromDir(const std::string &dirname,
 		bool is_dir =
 		    dent->d_type == DT_DIR ||
 		    (dent->d_type == DT_UNKNOWN && IsDir(dent->d_name));
-		std::string path = PathJoin(dirname, dent->d_name);
+		std::string path = PathJoin(dfsdir.path, dent->d_name);
 
 		if (is_dir) {
 			if (DirEmpty(path) && FileAgeSeconds(path) > 30) {
@@ -1274,7 +1296,7 @@ VCoproc::FetchFilesFromDir(const std::string &dirname,
 				 * producer has the chance to
 				 * move something inside. The
 				 * removal also helps to do less
-				 * BFS work.
+				 * DFS work.
 				 */
 				if (rmdir(path.c_str())) {
 					std::cerr << logb(LogErr)
@@ -1294,11 +1316,11 @@ VCoproc::FetchFilesFromDir(const std::string &dirname,
 				}
 			} else {
 				/*
-				 * We found a non-empty
-				 * subdirectory. Append it to
-				 * the BFS frontier set.
+				 * We found a non-empty subdirectory. Append
+				 * it to the DFS frontier set.
 				 */
-				frontier.push_back(std::move(path));
+				frontier.push_back(
+				    DFSDir(std::move(path), dfsdir.depth + 1));
 			}
 			continue;
 		}
