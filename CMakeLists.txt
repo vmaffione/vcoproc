@@ -46,7 +46,7 @@ include_directories(${INCLUDE_DIR})
 enable_testing()
 
 # Install the systemd services
-#install(FILES vcoproc.service DESTINATION /usr/share/vcoproc/examples/)
+install(FILES vcoproc.service DESTINATION /usr/share/vcoproc/examples/)
 
 # Include the subdirectory which contains the actual sources.
 add_subdirectory(src)

@@ -1,0 +1,15 @@
+[Unit]
+Description=Processes audio files and produces JSON output
+After=network.target
+PartOf=voicecoproc.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/vcoproc -s SrcFoo -i in/ -o out/ -F out/ -D prova.db -H 127.0.0.1 -p 6464 -v -n 20 -m
+RestartSec=5
+Restart=always
+StandardError=inherit
+
+[Install]
+WantedBy=multi-user.target
+
