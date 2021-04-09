@@ -284,8 +284,10 @@ logb(int loglevel)
 std::string
 PathJoin(const std::string &dirpath, const std::string &name)
 {
+	std::string basename = FileBaseName(name);
+
 	if (dirpath.empty()) {
-		return name;
+		return basename;
 	}
 
 	std::string res = dirpath;
@@ -294,7 +296,7 @@ PathJoin(const std::string &dirpath, const std::string &name)
 		res += '/';
 	}
 
-	return res + name;
+	return res + basename;
 }
 
 int
@@ -394,8 +396,7 @@ MoveToDir(const std::string &dir, const std::string &src)
 		return -1;
 	}
 
-	dstpath = FileBaseName(src);
-	dstpath = PathJoin(dir, dstpath);
+	dstpath = PathJoin(dir, src);
 
 	if (rename(src.c_str(), dstpath.c_str())) {
 		std::cerr << "Failed to rename " << src << " --> " << dstpath
@@ -423,8 +424,7 @@ CopyToDir(const std::string &dir, const std::string &srcname)
 		return -1;
 	}
 
-	dstpath = FileBaseName(srcname);
-	dstpath = PathJoin(dir, dstpath);
+	dstpath = PathJoin(dir, srcname);
 
 	return CopyFile(dstpath, srcname);
 }

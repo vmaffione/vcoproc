@@ -51,6 +51,7 @@ Usage(const char *progname)
 	    << "    -a ARCHIVE_DIR (directory where to archive processed wav "
 	       "files)"
 	    << std::endl
+	    << "    -C (compress archived files to mp3)" << std::endl
 	    << "    -D DB_FILE (path to the sqlite3 database file)" << std::endl
 	    << "    -c (consume input files)" << std::endl
 	    << "    -m (monitor input directories rather than stop when "
@@ -888,6 +889,7 @@ class VCoproc {
 	std::string failed_dir;
 	std::string forward_dir;
 	std::string archive_dir;
+	bool compress_archived = false;
 
 	/*
 	 * Max number of entries that we allow in the pending table
@@ -976,19 +978,21 @@ class VCoproc {
 	    std::string source, std::vector<std::string> input_dirs,
 	    std::vector<std::string> input_exts, std::string output_dir,
 	    std::string failed_dir, std::string forward_dir,
-	    std::string archive_dir, unsigned short max_pending,
-	    unsigned int stats_period, unsigned int retention_days,
-	    std::string dbfile, std::string host, unsigned short port);
+	    std::string archive_dir, bool compress_archived,
+	    unsigned short max_pending, unsigned int stats_period,
+	    unsigned int retention_days, std::string dbfile, std::string host,
+	    unsigned short port);
 
 	VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend>, int verbose,
 		bool consume, bool monitor, std::string source,
 		std::vector<std::string> input_dirs,
 		std::vector<std::string> input_exts, std::string output_dir,
 		std::string failed_dir, std::string forward_dir,
-		std::string archive_dir, unsigned short max_pending,
-		unsigned int stats_period, unsigned int retention_days,
-		std::string dbfile, std::unique_ptr<SQLiteDbConn> dbconn,
-		std::string host, unsigned short port);
+		std::string archive_dir, bool compress_archived,
+		unsigned short max_pending, unsigned int stats_period,
+		unsigned int retention_days, std::string dbfile,
+		std::unique_ptr<SQLiteDbConn> dbconn, std::string host,
+		unsigned short port);
 	~VCoproc();
 	int MainLoop();
 };
@@ -998,9 +1002,10 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		std::string source, std::vector<std::string> input_dirs,
 		std::vector<std::string> input_exts, std::string output_dir,
 		std::string failed_dir, std::string forward_dir,
-		std::string archive_dir, unsigned short max_pending,
-		unsigned int stats_period, unsigned int retention_days,
-		std::string dbfile, std::string host, unsigned short port)
+		std::string archive_dir, bool compress_archived,
+		unsigned short max_pending, unsigned int stats_period,
+		unsigned int retention_days, std::string dbfile,
+		std::string host, unsigned short port)
 {
 	if (source.empty()) {
 		std::cerr << logb(LogErr) << "No source/origin specified (-s)"
@@ -1138,9 +1143,9 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 	    stopfd, curlm, std::move(be), verbose, consume, monitor,
 	    std::move(source), std::move(input_dirs), std::move(input_exts),
 	    std::move(output_dir), std::move(failed_dir),
-	    std::move(forward_dir), std::move(archive_dir), max_pending,
-	    stats_period, retention_days, std::move(dbfile), std::move(dbconn),
-	    std::move(host), port);
+	    std::move(forward_dir), std::move(archive_dir), compress_archived,
+	    max_pending, stats_period, retention_days, std::move(dbfile),
+	    std::move(dbconn), std::move(host), port);
 }
 
 VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
@@ -1148,10 +1153,11 @@ VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
 		 std::vector<std::string> input_dirs,
 		 std::vector<std::string> input_exts, std::string output_dir,
 		 std::string failed_dir, std::string forward_dir,
-		 std::string archive_dir, unsigned short max_pending,
-		 unsigned int stats_period, unsigned int retention_days,
-		 std::string dbfile, std::unique_ptr<SQLiteDbConn> dbconn,
-		 std::string host, unsigned short port)
+		 std::string archive_dir, bool compress_archived,
+		 unsigned short max_pending, unsigned int stats_period,
+		 unsigned int retention_days, std::string dbfile,
+		 std::unique_ptr<SQLiteDbConn> dbconn, std::string host,
+		 unsigned short port)
     : stopfd(stopfd),
       curlm(curlm),
       be(std::move(be)),
@@ -1165,6 +1171,7 @@ VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
       failed_dir(std::move(failed_dir)),
       forward_dir(std::move(forward_dir)),
       archive_dir(std::move(archive_dir)),
+      compress_archived(compress_archived),
       max_pending(max_pending),
       stats_period(stats_period),
       retention_days(retention_days),
@@ -1614,7 +1621,27 @@ VCoproc::PostProcessFiles()
 			dstdirs.push_back(forward_dir);
 		}
 		if (success && archive) {
-			dstdirs.push_back(archive_dir);
+			if (compress_archived) {
+				std::string comprfile = PathJoin(
+				    archive_dir,
+				    PathNameNewExt(pf->FilePath(), "mp3"));
+				std::stringstream cmd;
+
+				cmd << "ffmpeg -loglevel quiet -y -i "
+				    << pf->FilePath() << " " << comprfile;
+				if (ExecuteCommand(cmd, verbose)) {
+					std::cerr << logb(LogErr)
+						  << "Failed to encode "
+						  << pf->FilePath() << " to MP3"
+						  << std::endl;
+				} else {
+					std::cout << logb(LogDbg) << "Encoded "
+						  << pf->FilePath() << " --> "
+						  << comprfile << std::endl;
+				}
+			} else {
+				dstdirs.push_back(archive_dir);
+			}
 		}
 
 		/*
@@ -2001,9 +2028,10 @@ main(int argc, char **argv)
 	std::string host;
 	unsigned short port = 0;
 	struct sigaction sa;
-	int verbose  = 0;
-	bool consume = false;
-	bool monitor = false;
+	int verbose	       = 0;
+	bool consume	       = false;
+	bool monitor	       = false;
+	bool compress_archived = false;
 	int opt, ret;
 
 	/*
@@ -2040,7 +2068,7 @@ main(int argc, char **argv)
 		return ret;
 	}
 
-	while ((opt = getopt(argc, argv, "hVvi:o:F:f:a:cmD:H:p:s:e:n:T:R:")) !=
+	while ((opt = getopt(argc, argv, "hVvi:o:F:f:a:CcmD:H:p:s:e:n:T:R:")) !=
 	       -1) {
 		switch (opt) {
 		case 'h':
@@ -2113,6 +2141,10 @@ main(int argc, char **argv)
 				return -1;
 			}
 			archive_dir = std::string(optarg);
+			break;
+
+		case 'C':
+			compress_archived = true;
 			break;
 
 		case 'c':
@@ -2188,8 +2220,8 @@ main(int argc, char **argv)
 	    stopfd_global, verbose, consume, monitor, std::move(source),
 	    std::move(input_dirs), std::move(input_exts), std::move(output_dir),
 	    std::move(failed_dir), std::move(forward_dir),
-	    std::move(archive_dir), max_pending, stats_period, retention_days,
-	    dbfile, host, port);
+	    std::move(archive_dir), compress_archived, max_pending,
+	    stats_period, retention_days, dbfile, host, port);
 	if (vcoproc == nullptr) {
 		return -1;
 	}
