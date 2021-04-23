@@ -785,7 +785,7 @@ PsBackend::PsBackend(std::string host, unsigned short port)
 	int_url = ss.str();
 
 	ss = std::stringstream();
-	ss << "http://" << host << ":" << port + 1;
+	ss << "http://" << host << ":" << port;
 	bat_url = ss.str();
 }
 
@@ -1749,6 +1749,37 @@ VCoproc::UpdateStatistics(bool force = false)
 	qss = std::stringstream();
 	qss << "DELETE FROM stats WHERE timestamp < " << retention_t;
 	dbconn->ModifyStmt(qss, verbose);
+
+	if (diff_seconds > 0.0) {
+		double fcmps =
+		    static_cast<double>(stats.files_completed) / diff_seconds;
+		double bcmps = static_cast<double>(stats.bytes_completed) /
+			       diff_seconds / 1024.0 / 1024.0;
+		double fscps =
+		    static_cast<double>(stats.files_scored) / diff_seconds;
+		double bscps = static_cast<double>(stats.bytes_scored) /
+			       diff_seconds / 1024.0 / 1024.0;
+		double amscps = stats.audiosec_scored / diff_seconds / 60.0;
+		double smscps = stats.speechsec_scored / diff_seconds / 60.0;
+		double fnmps =
+		    static_cast<double>(stats.files_nomdata) / diff_seconds;
+		double bnmps = static_cast<double>(stats.bytes_nomdata) /
+			       diff_seconds / 1024.0 / 1024.0;
+		double fflps =
+		    static_cast<double>(stats.files_failed) / diff_seconds;
+		double bflps = static_cast<double>(stats.bytes_failed) /
+			       diff_seconds / 1024.0 / 1024.0;
+		std::cout << "| total " << fcmps << " fps, " << bcmps
+			  << " MBps | "
+			  << "scored " << fscps << " fps, " << bscps
+			  << " MBps, " << amscps << " amps, " << smscps
+			  << " smps | "
+			  << "nomdata " << fnmps << " fps, " << bnmps
+			  << " MBps | "
+			  << "failed " << fflps << " fps, " << bflps
+			  << " MBps |" << std::endl
+			  << std::flush;
+	}
 
 	stats_start = std::chrono::system_clock::now();
 	stats	    = {};
