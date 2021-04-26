@@ -1241,6 +1241,11 @@ VCoproc::FetchMoreFiles()
 {
 	int credits = max_pending;
 
+	if (inprogress_counter >= max_pending) {
+		/* We're full. Don't even try. */
+		return true;
+	}
+
 	assert(input_dir_idx < input_dirs.size());
 
 	/*
@@ -1977,7 +1982,10 @@ VCoproc::MainLoop()
 		 * timeout and possibly wait.
 		 */
 
-		int timeout_ms = (AnyImmediateAction() || (num_running_curls == 0 && more_files)) ? 0 : 5000;
+		int timeout_ms = (AnyImmediateAction() ||
+				  (num_running_curls == 0 && more_files))
+				     ? 0
+				     : 5000;
 		struct curl_waitfd wfd[1];
 		wfd[0].fd      = stopfd;
 		wfd[0].events  = CURL_WAIT_POLLIN;
