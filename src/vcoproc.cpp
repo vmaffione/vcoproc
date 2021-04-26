@@ -328,13 +328,12 @@ class Backend {
 };
 
 enum class PendState {
-	None		= 0,
-	New		= 1,
-	ReadyToSubmit	= 2,
-	WaitingResponse = 3,
-	ProcSuccess	= 4,
-	ProcFailure	= 5,
-	Complete	= 6,
+	New		= 0,
+	ReadyToSubmit	= 1,
+	WaitingResponse = 2,
+	ProcSuccess	= 3,
+	ProcFailure	= 4,
+	Complete	= 5,
 };
 
 /*
@@ -488,8 +487,6 @@ std::string
 PendingFile::StateStr() const
 {
 	switch (state) {
-	case PendState::None:
-		return "None";
 	case PendState::New:
 		return "New";
 	case PendState::ReadyToSubmit:
@@ -898,6 +895,14 @@ class VCoproc {
 	unsigned short max_pending = 5;
 
 	/*
+	 * Minimum age of an empty input subdirectory to be elegible
+	 * for removal. This is useful for those cases where the
+	 * producer creates visible directories before filling
+	 * them with their complete contents.
+	 */
+	unsigned int dir_min_age = 0;
+
+	/*
 	 * Statistics update period in seconds, and retention days.
 	 */
 	unsigned int stats_period   = 300;
@@ -947,6 +952,9 @@ class VCoproc {
 	/* Map of in-progress pf entries. */
 	std::unordered_map<std::string, std::unique_ptr<PendingFile>> pending;
 
+	/* How many files are currently in progress. */
+	int inprogress_counter = 0;
+
 	/* A pair (path, depth) useful for depth-limited DFS. */
 	struct DFSDir {
 		std::string path;
@@ -956,6 +964,9 @@ class VCoproc {
 		}
 	};
 
+	void SetPendingFileState(const std::unique_ptr<PendingFile> &pf,
+				 PendState next_state);
+	void SetPendingFileState(PendingFile *pf, PendState next_state);
 	size_t FetchMoreFiles();
 	int FetchFilesFromDir(const DFSDir &dfsdir,
 			      std::deque<DFSDir> &frontier, int &credits);
@@ -1196,6 +1207,25 @@ VCoproc::~VCoproc()
 	}
 }
 
+void
+VCoproc::SetPendingFileState(const std::unique_ptr<PendingFile> &pf,
+			     PendState next_state)
+{
+	if (next_state == PendState::Complete) {
+		inprogress_counter--;
+	}
+	pf->SetState(next_state);
+}
+
+void
+VCoproc::SetPendingFileState(PendingFile *pf, PendState next_state)
+{
+	if (next_state == PendState::Complete) {
+		inprogress_counter--;
+	}
+	pf->SetState(next_state);
+}
+
 size_t
 VCoproc::FetchMoreFiles()
 {
@@ -1291,18 +1321,19 @@ VCoproc::FetchFilesFromDir(const DFSDir &dfsdir, std::deque<DFSDir> &frontier,
 		std::string path = PathJoin(dfsdir.path, dent->d_name);
 
 		if (is_dir) {
-			if (FileAgeSeconds(path) > 1 && DirEmpty(path)) {
+			if (DirEmpty(path) &&
+			    (dir_min_age == 0 ||
+			     FileAgeSeconds(path) >= dir_min_age)) {
 				/*
-				 * If we find an empty directory
-				 * that has not been modified in
-				 * a short while, we remove it.
-				 * The age check prevents
-				 * situations where we remove
-				 * directories created by the
-				 * input producer before the
-				 * producer has the chance to
-				 * move something inside. The
-				 * removal also helps to do less
+				 * If we find an empty directory that has
+				 * not been modified in a short while, we
+				 * remove it. The age check prevents
+				 * situations where we remove directories
+				 * created by the input producer before the
+				 * producer has the chance to move something
+				 * inside. Note that this should not happen
+				 * if the producer employs a strict "rsync"
+				 * convention. The removal also helps to do less
 				 * DFS work.
 				 */
 				if (rmdir(path.c_str())) {
@@ -1369,6 +1400,7 @@ VCoproc::FetchFilesFromDir(const DFSDir &dfsdir, std::deque<DFSDir> &frontier,
 			}
 			ret++; /* increment file count */
 			credits--;
+			inprogress_counter++;
 		}
 	}
 
@@ -1398,7 +1430,7 @@ VCoproc::PreProcessNewFiles()
 				break;
 			}
 		}
-		pf->SetState(PendState::ReadyToSubmit);
+		SetPendingFileState(pf, PendState::ReadyToSubmit);
 		progress++;
 	}
 }
@@ -1421,15 +1453,15 @@ VCoproc::PreparePostRequests()
 		/* Get the URL and content for the next POST. */
 		int r = pf->bt->PrepareRequest(url, req);
 		if (r) {
-			pf->SetState(PendState::ProcFailure);
+			SetPendingFileState(pf, PendState::ProcFailure);
 			continue;
 		}
 		/* Setup the POST request with CURL. */
 		if (pf->PreparePostCurl(url, req)) {
-			pf->SetState(PendState::ProcFailure);
+			SetPendingFileState(pf, PendState::ProcFailure);
 			continue;
 		}
-		pf->SetState(PendState::WaitingResponse);
+		SetPendingFileState(pf, PendState::WaitingResponse);
 	}
 }
 
@@ -1489,7 +1521,8 @@ VCoproc::RetireAndProcessPostResponses()
 			if (r == 0) {
 				/* The transaction is not
 				 * complete yet. */
-				pf->SetState(PendState::ReadyToSubmit);
+				SetPendingFileState(pf,
+						    PendState::ReadyToSubmit);
 				continue;
 			}
 			success = r > 0;
@@ -1547,11 +1580,11 @@ VCoproc::RetireAndProcessPostResponses()
 		}
 
 		if (!success) {
-			pf->SetState(PendState::ProcFailure);
+			SetPendingFileState(pf, PendState::ProcFailure);
 			stats.files_failed++;
 			stats.bytes_failed += pf->FileSize();
 		} else {
-			pf->SetState(PendState::ProcSuccess);
+			SetPendingFileState(pf, PendState::ProcSuccess);
 			if (pf->jout["status"] == "COMPLETE") {
 				stats.files_scored++;
 				stats.bytes_scored += pf->FileSize();
@@ -1685,7 +1718,7 @@ VCoproc::PostProcessFiles()
 		stats.bytes_completed += pf->FileSize();
 		stats.procsec_completed += pf->AgeSeconds();
 
-		pf->SetState(PendState::Complete);
+		SetPendingFileState(pf, PendState::Complete);
 		progress++;
 	}
 }
@@ -1698,7 +1731,7 @@ VCoproc::TimeoutWaitingRequests()
 
 		if (pf->State() == PendState::WaitingResponse &&
 		    pf->InactivitySeconds() > 120.0) {
-			pf->SetState(PendState::ProcFailure);
+			SetPendingFileState(pf, PendState::ProcFailure);
 			progress++;
 			std::cerr << logb(LogErr) << "File " << pf->FileName()
 				  << " timed out" << std::endl;
@@ -1972,7 +2005,7 @@ VCoproc::MainLoop()
 			break;
 		}
 
-		/* Retier and process any completed POST
+		/* Retire and process any completed POST
 		 * operations. */
 		if (!RetireAndProcessPostResponses()) {
 			/*
