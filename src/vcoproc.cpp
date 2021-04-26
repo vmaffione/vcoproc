@@ -2144,7 +2144,7 @@ main(int argc, char **argv)
 	}
 
 	while ((opt = getopt(argc, argv,
-			     "hVvi:o:F:f:a:CcmD:H:p:s:e:n:T:R:A")) != -1) {
+			     "hVvi:o:F:f:a:CcmD:H:p:s:e:n:T:R:A:")) != -1) {
 		switch (opt) {
 		case 'h':
 			Usage(argv[0]);
