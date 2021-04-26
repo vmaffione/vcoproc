@@ -970,7 +970,7 @@ class VCoproc {
 	void SetPendingFileState(const std::unique_ptr<PendingFile> &pf,
 				 PendState next_state);
 	void SetPendingFileState(PendingFile *pf, PendState next_state);
-	size_t FetchMoreFiles();
+	bool FetchMoreFiles();
 	int FetchFilesFromDir(const DFSDir &dfsdir,
 			      std::deque<DFSDir> &frontier, int &credits);
 	bool AnyPendingActivity(int num_running_curls) const;
@@ -1236,11 +1236,10 @@ VCoproc::SetPendingFileState(PendingFile *pf, PendState next_state)
 	pf->SetState(next_state);
 }
 
-size_t
+bool
 VCoproc::FetchMoreFiles()
 {
 	int credits = max_pending;
-	size_t num  = 0;
 
 	assert(input_dir_idx < input_dirs.size());
 
@@ -1266,7 +1265,6 @@ VCoproc::FetchMoreFiles()
 
 		while (!frontier.empty() && credits > 0) {
 			DFSDir dfsdir = frontier.back();
-			int ret;
 
 			frontier.pop_back();
 
@@ -1276,17 +1274,19 @@ VCoproc::FetchMoreFiles()
 				continue;
 			}
 
-			ret = FetchFilesFromDir(dfsdir, frontier, credits);
-			if (ret > 0) {
-				num += ret;
-			}
+			FetchFilesFromDir(dfsdir, frontier, credits);
 		}
 		if (++input_dir_idx >= input_dirs.size()) {
 			input_dir_idx = 0;
 		}
 	}
 
-	return num;
+	/*
+	 * If we ran out of credits it (likely) means that there are more
+	 * files. If we did not consume all the credits, it means that
+	 * there are no more files at the moment.
+	 */
+	return credits <= 0;
 }
 
 /* On success, this function returns the number of new files found. */
@@ -1957,14 +1957,14 @@ VCoproc::MainLoop()
 		 * Refill the pending table by fetching more
 		 * files from the input directories.
 		 */
-		size_t new_files = FetchMoreFiles();
+		bool more_files = FetchMoreFiles();
 
 		/*
 		 * When there are no more files to be processed
 		 * or pending activities, stop if we are not in
 		 * monitor mode.
 		 */
-		if (!monitor && new_files == 0 &&
+		if (!monitor && !more_files &&
 		    !AnyPendingActivity(num_running_curls)) {
 			break;
 		}
@@ -1976,7 +1976,8 @@ VCoproc::MainLoop()
 		 * (i.e., without waiting). Otherwise we set a non-zero
 		 * timeout and possibly wait.
 		 */
-		int timeout_ms = AnyImmediateAction() ? 0 : 5000;
+
+		int timeout_ms = (AnyImmediateAction() || (num_running_curls == 0 && more_files)) ? 0 : 5000;
 		struct curl_waitfd wfd[1];
 		wfd[0].fd      = stopfd;
 		wfd[0].events  = CURL_WAIT_POLLIN;
@@ -2038,6 +2039,7 @@ VCoproc::MainLoop()
 			 * already processed files.
 			 */
 			pending.clear();
+			inprogress_counter = 0;
 
 			std::cout << "Backend went offline. "
 				     "Waiting ..."
