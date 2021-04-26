@@ -1331,37 +1331,42 @@ VCoproc::FetchFilesFromDir(const DFSDir &dfsdir, std::deque<DFSDir> &frontier,
 		std::string path = PathJoin(dfsdir.path, dent->d_name);
 
 		if (is_dir) {
-			if (DirEmpty(path) &&
-			    (dir_min_age == 0 ||
-			     FileAgeSeconds(path) >= dir_min_age)) {
-				/*
-				 * If we find an empty directory that has
-				 * not been modified in a short while, we
-				 * remove it. The age check prevents
-				 * situations where we remove directories
-				 * created by the input producer before the
-				 * producer has the chance to move something
-				 * inside. Note that this should not happen
-				 * if the producer employs a strict "rsync"
-				 * convention. The removal also helps to do less
-				 * DFS work.
-				 */
-				if (rmdir(path.c_str())) {
-					std::cerr << logb(LogErr)
-						  << "Failed to "
-						     "remove empty "
-						     "directory "
-						  << path << ": "
-						  << strerror(errno)
-						  << std::endl
-						  << std::flush;
-				} else if (verbose) {
+			/*
+			 * If we find an empty directory that has not been
+			 * modified in a short while, we remove it. The age
+			 * check prevents situations where we remove
+			 * directories created by the input producer before the
+			 * producer has the chance to move something inside.
+			 * Note that this should not happen if the producer
+			 * employs a strict "rsync" convention. The removal
+			 * also helps to do less DFS work.
+			 */
+			if (dir_min_age > 0 &&
+			    FileAgeSeconds(path) < dir_min_age) {
+				std::cout << "ENTER HERE" << std::endl;
+				continue;
+			}
+
+			/*
+			 * We use rmdir() also to figure out whether the
+			 * directory is empty or not. This is more efficient
+			 * than using DirEmpty().
+			 */
+			int r = rmdir(path.c_str());
+			if (r == 0) {
+				if (verbose) {
 					std::cout << logb(LogDbg)
-						  << "Removed empty "
-						     "directory "
+						  << "Removed empty directory "
 						  << path << std::endl
 						  << std::flush;
 				}
+			} else if (errno != EEXIST && errno != ENOTEMPTY) {
+				std::cerr << logb(LogErr)
+					  << "Failed to "
+					     "remove empty directory "
+					  << path << ": " << strerror(errno)
+					  << std::endl
+					  << std::flush;
 			} else {
 				/*
 				 * We found a non-empty subdirectory. Append
