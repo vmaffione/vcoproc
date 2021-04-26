@@ -1291,7 +1291,7 @@ VCoproc::FetchFilesFromDir(const DFSDir &dfsdir, std::deque<DFSDir> &frontier,
 		std::string path = PathJoin(dfsdir.path, dent->d_name);
 
 		if (is_dir) {
-			if (DirEmpty(path) && FileAgeSeconds(path) > 30) {
+			if (FileAgeSeconds(path) > 30 && DirEmpty(path)) {
 				/*
 				 * If we find an empty directory
 				 * that has not been modified in
