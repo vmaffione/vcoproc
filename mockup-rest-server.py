@@ -88,7 +88,8 @@ class TestRequestHandler(myhttp.RequestHandler):
                 # Read the request body and parse it as JSON.
                 reqbody = self.rfile.read(content_length)
                 reqbody = reqbody.decode('utf8')
-                print(f"Received request {reqbody}")
+                if args.verbose:
+                    print(f"Received request {reqbody}")
                 try:
                         jsreq = json.loads(reqbody)
                 except Exception as e:
@@ -107,7 +108,7 @@ class TestRequestHandler(myhttp.RequestHandler):
                         return self.return_error(404)
 
         def do_POST_process(self, path, jsreq):
-                time.sleep(random.uniform(0.01, 1.1))
+                time.sleep(random.uniform(0.01, 0.050))
                 if random.uniform(0.0, 1.0) < 0.2:
                     jsresp = {'status': 'ERROR', 'reason': 'You unlucky'}
                 else:
