@@ -18,7 +18,7 @@ configure options:
     --help                      Show this help and exit
     --prefix                    [/] Prefix path for installation of kernel and user components
     --debug                     Compile in debug mode
-    --opt                       Compile with optimizations enabled (-O2)
+    --release                   Compile with optimizations enabled (-O2)
     --sanitize-includes         Use IWYU if available
     --clang                     Use clang/clang++ compilers for the build
 EOF
@@ -64,7 +64,7 @@ do
         DEBUG="y"
         ;;
 
-        "--opt")
+        "--release")
         OPTIMIZE="y"
         ;;
 
