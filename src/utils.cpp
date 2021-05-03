@@ -400,7 +400,7 @@ MoveToDir(const std::string &dir, const std::string &src)
 
 	if (rename(src.c_str(), dstpath.c_str())) {
 		std::cerr << "Failed to rename " << src << " --> " << dstpath
-			  << std::endl;
+			  << ": " << strerror(errno) << std::endl;
 		return -1;
 	}
 
