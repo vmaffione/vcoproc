@@ -169,6 +169,23 @@ struct IPAddr {
 	operator std::string() const { return repr; }
 };
 
+class DirScanner {
+	DIR *dir  = nullptr;
+	bool safe = false;
+	/* List of files, to be used in case safe = true. */
+	std::vector<std::string> files;
+	int next_file_idx = -1;
+
+	bool DoNext(std::string &entry);
+
+    public:
+	static std::unique_ptr<DirScanner> Create(const std::string &path,
+						  bool safe = false);
+	DirScanner(DIR *d, bool safe) : dir(d), safe(safe) {}
+	~DirScanner();
+	bool Next(std::string &entry);
+};
+
 } // namespace utils
 
 #endif /* __UTILS_HPP__ */

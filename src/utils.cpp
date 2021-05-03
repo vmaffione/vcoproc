@@ -700,4 +700,64 @@ IPAddr::StrNoPrefix() const
 	return repr.substr(0, slash);
 }
 
+std::unique_ptr<DirScanner>
+DirScanner::Create(const std::string &path, bool safe)
+{
+	DIR *dir = opendir(path.c_str());
+
+	if (dir == nullptr) {
+		std::cerr << logb(LogErr) << "Failed to opendir(" << path
+			  << "): " << strerror(errno) << std::endl;
+		return nullptr;
+	}
+
+	return std::make_unique<DirScanner>(dir, safe);
+}
+
+DirScanner::~DirScanner()
+{
+	if (dir) {
+		closedir(dir);
+		dir = nullptr;
+	}
+}
+
+bool
+DirScanner::DoNext(std::string &entry)
+{
+	struct dirent *dent;
+
+	while ((dent = readdir(dir)) != nullptr) {
+		if (strcmp(dent->d_name, ".") && strcmp(dent->d_name, "..")) {
+			entry = std::string(dent->d_name);
+			return true;
+		}
+	}
+
+	return false;
+}
+
+bool
+DirScanner::Next(std::string &entry)
+{
+	if (!safe) {
+		return DoNext(entry);
+	}
+
+	if (next_file_idx < 0) {
+		/* Pre-load. */
+		std::string file;
+
+		while (DoNext(file)) {
+			files.push_back(file);
+		}
+		next_file_idx = 0;
+	}
+	if (next_file_idx < static_cast<int>(files.size())) {
+		entry = files[next_file_idx++];
+		return true;
+	}
+	return false;
+}
+
 } // namespace utils
