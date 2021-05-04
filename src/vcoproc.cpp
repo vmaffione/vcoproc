@@ -2310,6 +2310,9 @@ main(int argc, char **argv)
 			input_exts.push_back(ext);
 			break;
 		}
+		default:
+			return -1;
+			break;
 		}
 	}
 
