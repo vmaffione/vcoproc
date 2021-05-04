@@ -1348,7 +1348,6 @@ VCoproc::FetchFilesFromDir(const DFSDir &dfsdir, std::deque<DFSDir> &frontier,
 			 */
 			if (dir_min_age > 0 &&
 			    FileAgeSeconds(path) < dir_min_age) {
-				std::cout << "ENTER HERE" << std::endl;
 				continue;
 			}
 
