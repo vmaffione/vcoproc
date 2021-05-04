@@ -399,9 +399,26 @@ MoveToDir(const std::string &dir, const std::string &src)
 	dstpath = PathJoin(dir, src);
 
 	if (rename(src.c_str(), dstpath.c_str())) {
-		std::cerr << "Failed to rename " << src << " --> " << dstpath
-			  << ": " << strerror(errno) << std::endl;
-		return -1;
+		if (errno != EXDEV) {
+			std::cerr << "Failed to rename " << src << " --> "
+				  << dstpath << ": " << strerror(errno)
+				  << std::endl;
+			return -1;
+		}
+		/*
+		 * We cannot rename a file across different file systems.
+		 * Fallback on copy to the destination file system and
+		 * remove the original one.
+		 */
+		if (CopyFile(dstpath, src)) {
+			std::cerr << "Failed to copy " << src << " --> "
+				  << dstpath << ": " << strerror(errno)
+				  << std::endl;
+			return -1;
+		}
+		if (RemoveFile(src)) {
+			return -1;
+		}
 	}
 
 	return 0;
