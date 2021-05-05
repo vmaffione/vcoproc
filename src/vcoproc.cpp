@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <mysql/mysql.h>
 #include <poll.h>
 #include <regex>
 #include <signal.h>
@@ -116,7 +117,11 @@ SigintHandler(int signum)
 
 } // namespace
 
-struct DBSpec {
+/*
+ * Support for database access.
+ */
+
+struct DbSpec {
 	/* In case of SQLite. */
 	std::string dbfile;
 
@@ -134,7 +139,7 @@ struct DBSpec {
 };
 
 void
-DBSpec::Dump() const
+DbSpec::Dump() const
 {
 	if (!dbfile.empty()) {
 		std::cout << "DB file: " << dbfile << std::endl;
@@ -148,13 +153,13 @@ DBSpec::Dump() const
 }
 
 bool
-DBSpec::IsMySQL() const
+DbSpec::IsMySQL() const
 {
 	return !(host.empty() || dbname.empty() || user.empty());
 }
 
 bool
-DBSpec::IsSQLite() const
+DbSpec::IsSQLite() const
 {
 	return !dbfile.empty();
 }
@@ -178,6 +183,10 @@ class DbConn {
 	virtual ~DbConn() {}
 };
 
+/*
+ * SQLite3 database support.
+ */
+
 class SQLiteDbCursor : public DbCursor {
 	sqlite3 *dbh	   = nullptr;
 	sqlite3_stmt *stmt = nullptr;
@@ -192,6 +201,19 @@ class SQLiteDbCursor : public DbCursor {
 	bool RowColumnCheck(unsigned int idx);
 	bool RowColumn(unsigned int idx, int &val, bool mayfail = false);
 	bool RowColumn(unsigned int idx, std::string &s, bool mayfail = false);
+};
+
+class SQLiteDbConn : public DbConn {
+	sqlite3 *dbh = nullptr;
+
+    public:
+	static std::unique_ptr<DbConn> Create(const std::string &dbfile);
+	SQLiteDbConn(sqlite3 *dbh) : dbh(dbh) {}
+	~SQLiteDbConn();
+
+	int ModifyStmt(const std::stringstream &ss, int verbose);
+	std::unique_ptr<DbCursor> SelectStmt(const std::stringstream &ss,
+					     int verbose);
 };
 
 SQLiteDbCursor::~SQLiteDbCursor()
@@ -283,19 +305,6 @@ SQLiteDbCursor::RowColumn(unsigned int idx, std::string &s, bool mayfail)
 	return true;
 }
 
-class SQLiteDbConn : public DbConn {
-	sqlite3 *dbh = nullptr;
-
-    public:
-	static std::unique_ptr<DbConn> Create(const std::string &dbfile);
-	SQLiteDbConn(sqlite3 *dbh) : dbh(dbh) {}
-	~SQLiteDbConn();
-
-	int ModifyStmt(const std::stringstream &ss, int verbose);
-	std::unique_ptr<DbCursor> SelectStmt(const std::stringstream &ss,
-					     int verbose);
-};
-
 std::unique_ptr<DbConn>
 SQLiteDbConn::Create(const std::string &dbfile)
 {
@@ -378,6 +387,170 @@ SQLiteDbConn::SelectStmt(const std::stringstream &ss, int verbose)
 
 	// TODO reference count the cursors ?
 	return std::make_unique<SQLiteDbCursor>(dbh, pstmt);
+}
+
+/*
+ * MySQL/mariadb database support.
+ */
+
+class MySQLDbCursor : public DbCursor {
+	MYSQL *dbc	= nullptr;
+	MYSQL_RES *qres = nullptr;
+	MYSQL_ROW row	= nullptr;
+
+    public:
+	MySQLDbCursor(MYSQL *dbc, MYSQL_RES *qres) : dbc(dbc), qres(qres) {}
+	~MySQLDbCursor();
+	int NextRow();
+	bool RowColumnCheck(unsigned int idx);
+	bool RowColumn(unsigned int idx, int &val, bool mayfail = false);
+	bool RowColumn(unsigned int idx, std::string &s, bool mayfail = false);
+};
+
+class MySQLDbConn : public DbConn {
+	MYSQL *dbc = nullptr;
+
+    public:
+	static std::unique_ptr<DbConn> Create(const DbSpec &dbspec);
+	MySQLDbConn(MYSQL *dbc) : dbc(dbc) {}
+	~MySQLDbConn();
+
+	int ModifyStmt(const std::stringstream &ss, int verbose);
+	std::unique_ptr<DbCursor> SelectStmt(const std::stringstream &ss,
+					     int verbose);
+};
+
+MySQLDbCursor::~MySQLDbCursor()
+{
+	if (qres) {
+		mysql_free_result(qres);
+	}
+}
+
+int
+MySQLDbCursor::NextRow()
+{
+	row = mysql_fetch_row(qres);
+
+	return (row != nullptr) ? 1 : 0;
+}
+
+bool
+MySQLDbCursor::RowColumnCheck(unsigned int idx)
+{
+	if (row == nullptr || qres == nullptr) {
+		std::cerr << logb(LogErr) << "No row is available" << std::endl;
+		return false;
+	}
+
+	if (idx >= static_cast<unsigned int>(mysql_num_fields(qres))) {
+		std::cerr << logb(LogErr) << "Field index " << idx
+			  << " out of range" << std::endl;
+		return false;
+	}
+
+	return row[idx] != nullptr;
+}
+
+bool
+MySQLDbCursor::RowColumn(unsigned int idx, int &val, bool mayfail)
+{
+	if (!RowColumnCheck(idx)) {
+		assert(mayfail);
+		return false;
+	}
+
+	return Str2Num<int>(std::string(row[idx]), val);
+}
+
+bool
+MySQLDbCursor::RowColumn(unsigned int idx, std::string &s, bool mayfail)
+{
+	if (!RowColumnCheck(idx)) {
+		assert(mayfail);
+		return false;
+	}
+
+	s = std::string(row[idx]);
+
+	return true;
+}
+
+std::unique_ptr<DbConn>
+MySQLDbConn::Create(const DbSpec &dbspec)
+{
+	MYSQL *dbc = mysql_init(nullptr);
+
+	if (dbc == nullptr) {
+		std::cerr << logb(LogErr)
+			  << "Failed to initialize MySQL client: "
+			  << mysql_error(dbc) << std::endl;
+		return nullptr;
+	}
+	if (mysql_real_connect(dbc, dbspec.host.c_str(), dbspec.user.c_str(),
+			       dbspec.password.c_str(), dbspec.dbname.c_str(),
+			       0, NULL, 0) == nullptr) {
+		std::cerr << logb(LogErr)
+			  << "Failed to connect to DB: " << mysql_error(dbc)
+			  << std::endl;
+		return nullptr;
+	}
+
+	if (true) {
+		std::cout << "Connected to MySQL server "
+			  << mysql_get_server_info(dbc) << ", "
+			  << mysql_get_host_info(dbc) << std::endl;
+	}
+
+	return std::make_unique<MySQLDbConn>(dbc);
+}
+
+MySQLDbConn::~MySQLDbConn()
+{
+	if (dbc != nullptr) {
+		mysql_close(dbc);
+	}
+}
+
+int
+MySQLDbConn::ModifyStmt(const std::stringstream &ss, int verbose)
+{
+	if (verbose) {
+		std::cout << "Q: " << ss.str() << std::endl;
+	}
+
+	if (mysql_query(dbc, ss.str().c_str())) {
+		std::cerr << logb(LogErr)
+			  << "Query failed: " << mysql_error(dbc) << std::endl;
+		return -1;
+	}
+
+	return 0;
+}
+
+std::unique_ptr<DbCursor>
+MySQLDbConn::SelectStmt(const std::stringstream &ss, int verbose)
+{
+	if (verbose) {
+		std::cout << "Q: " << ss.str() << std::endl;
+	}
+
+	if (mysql_query(dbc, ss.str().c_str())) {
+		std::cerr << logb(LogErr)
+			  << "Query failed: " << mysql_error(dbc) << std::endl;
+		return nullptr;
+	}
+
+	/* See mysql_store_result() vs mysql_use_result(). */
+	MYSQL_RES *qres = mysql_store_result(dbc);
+	if (qres == nullptr) {
+		std::cerr << logb(LogErr)
+			  << "mysql_store_result() failed: " << mysql_error(dbc)
+			  << std::endl;
+		return nullptr;
+	}
+
+	return std::make_unique<MySQLDbCursor>(dbc, qres);
 }
 
 class BackendTransaction {
@@ -975,7 +1148,7 @@ class VCoproc {
 	unsigned int stats_period   = 300;
 	unsigned int retention_days = 7;
 
-	struct DBSpec dbspec;
+	struct DbSpec dbspec;
 	std::unique_ptr<DbConn> dbconn;
 	std::string host;
 	unsigned short port  = 0;
@@ -1059,7 +1232,7 @@ class VCoproc {
 	    std::string archive_dir, bool compress_archived,
 	    unsigned short max_pending, unsigned short dir_min_age,
 	    unsigned int stats_period, unsigned int retention_days,
-	    struct DBSpec dbspec, std::string host, unsigned short port);
+	    struct DbSpec dbspec, std::string host, unsigned short port);
 
 	VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend>, int verbose,
 		bool consume, bool monitor, std::string source,
@@ -1069,7 +1242,7 @@ class VCoproc {
 		std::string archive_dir, bool compress_archived,
 		unsigned short max_pending, unsigned short dir_min_age,
 		unsigned int stats_period, unsigned int retention_days,
-		struct DBSpec dbspec, std::unique_ptr<DbConn> dbconn,
+		struct DbSpec dbspec, std::unique_ptr<DbConn> dbconn,
 		std::string host, unsigned short port);
 	~VCoproc();
 	int MainLoop();
@@ -1083,7 +1256,7 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		std::string archive_dir, bool compress_archived,
 		unsigned short max_pending, unsigned short dir_min_age,
 		unsigned int stats_period, unsigned int retention_days,
-		struct DBSpec dbspec, std::string host, unsigned short port)
+		struct DbSpec dbspec, std::string host, unsigned short port)
 {
 	if (source.empty()) {
 		std::cerr << logb(LogErr) << "No source/origin specified (-s)"
@@ -1240,7 +1413,7 @@ VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
 		 std::string archive_dir, bool compress_archived,
 		 unsigned short max_pending, unsigned short dir_min_age,
 		 unsigned int stats_period, unsigned int retention_days,
-		 struct DBSpec dbspec, std::unique_ptr<DbConn> dbconn,
+		 struct DbSpec dbspec, std::unique_ptr<DbConn> dbconn,
 		 std::string host, unsigned short port)
     : stopfd(stopfd),
       curlm(curlm),
@@ -2184,7 +2357,7 @@ main(int argc, char **argv)
 	bool consume	       = false;
 	bool monitor	       = false;
 	bool compress_archived = false;
-	struct DBSpec dbspec;
+	struct DbSpec dbspec;
 	int opt, ret;
 
 	/*
