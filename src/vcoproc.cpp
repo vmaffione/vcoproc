@@ -159,7 +159,26 @@ DBSpec::IsSQLite() const
 	return !dbfile.empty();
 }
 
-class SQLiteDbCursor {
+class DbCursor {
+    public:
+	virtual int NextRow()			      = 0;
+	virtual bool RowColumnCheck(unsigned int idx) = 0;
+	virtual bool RowColumn(unsigned int idx, int &val,
+			       bool mayfail = false)  = 0;
+	virtual bool RowColumn(unsigned int idx, std::string &s,
+			       bool mayfail = false)  = 0;
+	virtual ~DbCursor() {}
+};
+
+class DbConn {
+    public:
+	virtual int ModifyStmt(const std::stringstream &ss, int verbose) = 0;
+	virtual std::unique_ptr<DbCursor> SelectStmt(
+	    const std::stringstream &ss, int verbose) = 0;
+	virtual ~DbConn() {}
+};
+
+class SQLiteDbCursor : public DbCursor {
 	sqlite3 *dbh	   = nullptr;
 	sqlite3_stmt *stmt = nullptr;
 	bool row_valid	   = false;
@@ -264,20 +283,20 @@ SQLiteDbCursor::RowColumn(unsigned int idx, std::string &s, bool mayfail)
 	return true;
 }
 
-class SQLiteDbConn {
+class SQLiteDbConn : public DbConn {
 	sqlite3 *dbh = nullptr;
 
     public:
-	static std::unique_ptr<SQLiteDbConn> Create(const std::string &dbfile);
+	static std::unique_ptr<DbConn> Create(const std::string &dbfile);
 	SQLiteDbConn(sqlite3 *dbh) : dbh(dbh) {}
 	~SQLiteDbConn();
 
 	int ModifyStmt(const std::stringstream &ss, int verbose);
-	std::unique_ptr<SQLiteDbCursor> SelectStmt(const std::stringstream &ss,
-						   int verbose);
+	std::unique_ptr<DbCursor> SelectStmt(const std::stringstream &ss,
+					     int verbose);
 };
 
-std::unique_ptr<SQLiteDbConn>
+std::unique_ptr<DbConn>
 SQLiteDbConn::Create(const std::string &dbfile)
 {
 	sqlite3 *pdbh;
@@ -339,7 +358,7 @@ SQLiteDbConn::ModifyStmt(const std::stringstream &ss, int verbose)
 	return fret == SQLITE_OK ? 0 : -1;
 }
 
-std::unique_ptr<SQLiteDbCursor>
+std::unique_ptr<DbCursor>
 SQLiteDbConn::SelectStmt(const std::stringstream &ss, int verbose)
 {
 	if (verbose) {
@@ -957,7 +976,7 @@ class VCoproc {
 	unsigned int retention_days = 7;
 
 	struct DBSpec dbspec;
-	std::unique_ptr<SQLiteDbConn> dbconn;
+	std::unique_ptr<DbConn> dbconn;
 	std::string host;
 	unsigned short port  = 0;
 	size_t input_dir_idx = 0;
@@ -1050,7 +1069,7 @@ class VCoproc {
 		std::string archive_dir, bool compress_archived,
 		unsigned short max_pending, unsigned short dir_min_age,
 		unsigned int stats_period, unsigned int retention_days,
-		struct DBSpec dbspec, std::unique_ptr<SQLiteDbConn> dbconn,
+		struct DBSpec dbspec, std::unique_ptr<DbConn> dbconn,
 		std::string host, unsigned short port);
 	~VCoproc();
 	int MainLoop();
@@ -1221,7 +1240,7 @@ VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
 		 std::string archive_dir, bool compress_archived,
 		 unsigned short max_pending, unsigned short dir_min_age,
 		 unsigned int stats_period, unsigned int retention_days,
-		 struct DBSpec dbspec, std::unique_ptr<SQLiteDbConn> dbconn,
+		 struct DBSpec dbspec, std::unique_ptr<DbConn> dbconn,
 		 std::string host, unsigned short port)
     : stopfd(stopfd),
       curlm(curlm),
