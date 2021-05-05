@@ -133,10 +133,25 @@ struct DbSpec {
 	std::string password;
 	std::string tablename;
 
+	std::string Repr() const;
 	void Dump() const;
 	bool IsMySQL() const;
 	bool IsSQLite() const;
 };
+
+std::string
+DbSpec::Repr() const
+{
+	if (IsMySQL()) {
+		return user + "@" + host + ":" + dbname + "." + tablename;
+	}
+
+	if (IsSQLite()) {
+		return dbfile;
+	}
+
+	return std::string();
+}
 
 void
 DbSpec::Dump() const
@@ -1343,18 +1358,42 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 	}
 
 	/* Open a (long-lived) database connection. */
-	auto dbconn = SQLiteDbConn::Create(dbspec.dbfile);
-	if (dbconn == nullptr) {
-		std::cerr << logb(LogErr) << "Failed to connect to database "
-			  << dbspec.dbfile << std::endl;
+
+	std::unique_ptr<DbConn> dbconn;
+
+	if (dbspec.IsMySQL()) {
+		dbconn = MySQLDbConn::Create(dbspec);
+		if (dbconn == nullptr) {
+			std::cerr << logb(LogErr)
+				  << "Failed to connect to MySQL database "
+				  << dbspec.Repr() << std::endl;
+			return nullptr;
+		}
+
+	} else if (dbspec.IsSQLite()) {
+		dbconn = SQLiteDbConn::Create(dbspec.dbfile);
+		if (dbconn == nullptr) {
+			std::cerr << logb(LogErr)
+				  << "Failed to open SQLite database "
+				  << dbspec.dbfile << std::endl;
+			return nullptr;
+		}
+
+	} else {
+		std::cerr << logb(LogErr) << "No suitable database to open"
+			  << std::endl;
 		return nullptr;
 	}
 
 	/* Create the stats table if it does not exist
 	 * already. */
 	{
+		if (dbspec.tablename.empty()) {
+			dbspec.tablename = "stats";
+		}
+
 		std::stringstream qss;
-		qss << "CREATE TABLE IF NOT EXISTS stats ("
+		qss << "CREATE TABLE IF NOT EXISTS " << dbspec.tablename << " ("
 		    << "timestamp UNSIGNED INTEGER PRIMARY KEY "
 		       "NOT NULL, "
 		    << "diffseconds DOUBLE "
@@ -2009,7 +2048,8 @@ VCoproc::UpdateStatistics(bool force = false)
 		return 0;
 	}
 
-	qss << "INSERT INTO stats(timestamp, diffseconds, files_scored, "
+	qss << "INSERT INTO " << dbspec.tablename
+	    << "(timestamp, diffseconds, files_scored, "
 	       "bytes_scored, audiosec_scored, "
 	       "speechsec_scored, "
 	       "files_nomdata, bytes_nomdata, "
@@ -2036,7 +2076,8 @@ VCoproc::UpdateStatistics(bool force = false)
 
 	retention_t -= retention_days * 24 * 60 * 60;
 	qss = std::stringstream();
-	qss << "DELETE FROM stats WHERE timestamp < " << retention_t;
+	qss << "DELETE FROM " << dbspec.tablename << " WHERE timestamp < "
+	    << retention_t;
 	dbconn->ModifyStmt(qss, verbose);
 
 	if (diff_seconds > 0.0) {
