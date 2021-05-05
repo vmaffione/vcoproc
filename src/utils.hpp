@@ -6,8 +6,10 @@
 #define __UTILS_HPP__
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <string>
 #include <sstream>
+#include <sys/types.h>
 #include <unistd.h>
 #include <vector>
 
