@@ -196,6 +196,7 @@ class DbConn {
 	virtual std::unique_ptr<DbCursor> SelectStmt(
 	    const std::stringstream &ss, int verbose) = 0;
 	virtual ~DbConn() {}
+	virtual std::string CurrentUnixTime() const = 0;
 };
 
 /*
@@ -229,6 +230,7 @@ class SQLiteDbConn : public DbConn {
 	int ModifyStmt(const std::stringstream &ss, int verbose);
 	std::unique_ptr<DbCursor> SelectStmt(const std::stringstream &ss,
 					     int verbose);
+	std::string CurrentUnixTime() const { return "strftime('%s', 'now')"; }
 };
 
 SQLiteDbCursor::~SQLiteDbCursor()
@@ -433,6 +435,7 @@ class MySQLDbConn : public DbConn {
 	int ModifyStmt(const std::stringstream &ss, int verbose);
 	std::unique_ptr<DbCursor> SelectStmt(const std::stringstream &ss,
 					     int verbose);
+	std::string CurrentUnixTime() const { return "UNIX_TIMESTAMP(NOW())"; }
 };
 
 MySQLDbCursor::~MySQLDbCursor()
@@ -2058,15 +2061,15 @@ VCoproc::UpdateStatistics(bool force = false)
 	       "bytes_timedout, "
 	       "files_completed, bytes_completed, "
 	       "procsec_completed) "
-	       "VALUES(strftime('%s','now'), "
-	    << diff_seconds << "," << stats.files_scored << ","
-	    << stats.bytes_scored << "," << stats.audiosec_scored << ","
-	    << stats.speechsec_scored << "," << stats.files_nomdata << ","
-	    << stats.bytes_nomdata << "," << stats.audiosec_nomdata << ","
-	    << stats.files_failed << "," << stats.bytes_failed << ","
-	    << stats.files_timedout << "," << stats.bytes_timedout << ","
-	    << stats.files_completed << "," << stats.bytes_completed << ","
-	    << stats.procsec_completed << ")";
+	       "VALUES("
+	    << dbconn->CurrentUnixTime() << ", " << diff_seconds << ","
+	    << stats.files_scored << "," << stats.bytes_scored << ","
+	    << stats.audiosec_scored << "," << stats.speechsec_scored << ","
+	    << stats.files_nomdata << "," << stats.bytes_nomdata << ","
+	    << stats.audiosec_nomdata << "," << stats.files_failed << ","
+	    << stats.bytes_failed << "," << stats.files_timedout << ","
+	    << stats.bytes_timedout << "," << stats.files_completed << ","
+	    << stats.bytes_completed << "," << stats.procsec_completed << ")";
 	if (dbconn->ModifyStmt(qss, verbose)) {
 		return -1;
 	}
