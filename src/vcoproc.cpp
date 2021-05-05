@@ -52,7 +52,9 @@ Usage(const char *progname)
 	       "files)"
 	    << std::endl
 	    << "    -C (compress archived files to mp3)" << std::endl
-	    << "    -D DB_FILE (path to the sqlite3 database file)" << std::endl
+	    << "    -D DB_FILE (mysql connection string or path to sqlite3 "
+	       "database file)"
+	    << std::endl
 	    << "    -c (consume input files)" << std::endl
 	    << "    -m (monitor input directories rather than stop when "
 	       "running out of files)"
@@ -113,6 +115,49 @@ SigintHandler(int signum)
 }
 
 } // namespace
+
+struct DBSpec {
+	/* In case of SQLite. */
+	std::string dbfile;
+
+	/* In case of MySQL. */
+	std::string host;
+	unsigned short port = 3306;
+	std::string dbname;
+	std::string user;
+	std::string password;
+	std::string tablename;
+
+	void Dump() const;
+	bool IsMySQL() const;
+	bool IsSQLite() const;
+};
+
+void
+DBSpec::Dump() const
+{
+	if (!dbfile.empty()) {
+		std::cout << "DB file: " << dbfile << std::endl;
+	} else {
+		std::cout << "DB host  : " << host << ":" << port << std::endl;
+		std::cout << "DB name  : " << dbname << std::endl;
+		std::cout << "DB user  : " << user << std::endl;
+		std::cout << "DB passwd: " << password << std::endl;
+		std::cout << "DB table : " << tablename << std::endl;
+	}
+}
+
+bool
+DBSpec::IsMySQL() const
+{
+	return !(host.empty() || dbname.empty() || user.empty());
+}
+
+bool
+DBSpec::IsSQLite() const
+{
+	return !dbfile.empty();
+}
 
 class SQLiteDbCursor {
 	sqlite3 *dbh	   = nullptr;
@@ -911,7 +956,7 @@ class VCoproc {
 	unsigned int stats_period   = 300;
 	unsigned int retention_days = 7;
 
-	std::string dbfile;
+	struct DBSpec dbspec;
 	std::unique_ptr<SQLiteDbConn> dbconn;
 	std::string host;
 	unsigned short port  = 0;
@@ -995,7 +1040,7 @@ class VCoproc {
 	    std::string archive_dir, bool compress_archived,
 	    unsigned short max_pending, unsigned short dir_min_age,
 	    unsigned int stats_period, unsigned int retention_days,
-	    std::string dbfile, std::string host, unsigned short port);
+	    struct DBSpec dbspec, std::string host, unsigned short port);
 
 	VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend>, int verbose,
 		bool consume, bool monitor, std::string source,
@@ -1005,7 +1050,7 @@ class VCoproc {
 		std::string archive_dir, bool compress_archived,
 		unsigned short max_pending, unsigned short dir_min_age,
 		unsigned int stats_period, unsigned int retention_days,
-		std::string dbfile, std::unique_ptr<SQLiteDbConn> dbconn,
+		struct DBSpec dbspec, std::unique_ptr<SQLiteDbConn> dbconn,
 		std::string host, unsigned short port);
 	~VCoproc();
 	int MainLoop();
@@ -1019,7 +1064,7 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		std::string archive_dir, bool compress_archived,
 		unsigned short max_pending, unsigned short dir_min_age,
 		unsigned int stats_period, unsigned int retention_days,
-		std::string dbfile, std::string host, unsigned short port)
+		struct DBSpec dbspec, std::string host, unsigned short port)
 {
 	if (source.empty()) {
 		std::cerr << logb(LogErr) << "No source/origin specified (-s)"
@@ -1075,8 +1120,8 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		return nullptr;
 	}
 
-	if (dbfile.empty()) {
-		std::cerr << logb(LogErr) << "No database file specified (-D)"
+	if (!dbspec.IsMySQL() && !dbspec.IsSQLite()) {
+		std::cerr << logb(LogErr) << "No valid database specified (-D)"
 			  << std::endl;
 		return nullptr;
 	}
@@ -1106,10 +1151,10 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 	}
 
 	/* Open a (long-lived) database connection. */
-	auto dbconn = SQLiteDbConn::Create(dbfile);
+	auto dbconn = SQLiteDbConn::Create(dbspec.dbfile);
 	if (dbconn == nullptr) {
 		std::cerr << logb(LogErr) << "Failed to connect to database "
-			  << dbfile << std::endl;
+			  << dbspec.dbfile << std::endl;
 		return nullptr;
 	}
 
@@ -1165,7 +1210,7 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 	    std::move(output_dir), std::move(failed_dir),
 	    std::move(forward_dir), std::move(archive_dir), compress_archived,
 	    max_pending, dir_min_age, stats_period, retention_days,
-	    std::move(dbfile), std::move(dbconn), std::move(host), port);
+	    std::move(dbspec), std::move(dbconn), std::move(host), port);
 }
 
 VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
@@ -1176,7 +1221,7 @@ VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
 		 std::string archive_dir, bool compress_archived,
 		 unsigned short max_pending, unsigned short dir_min_age,
 		 unsigned int stats_period, unsigned int retention_days,
-		 std::string dbfile, std::unique_ptr<SQLiteDbConn> dbconn,
+		 struct DBSpec dbspec, std::unique_ptr<SQLiteDbConn> dbconn,
 		 std::string host, unsigned short port)
     : stopfd(stopfd),
       curlm(curlm),
@@ -1196,7 +1241,7 @@ VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
       dir_min_age(dir_min_age),
       stats_period(stats_period),
       retention_days(retention_days),
-      dbfile(std::move(dbfile)),
+      dbspec(std::move(dbspec)),
       dbconn(std::move(dbconn)),
       host(std::move(host)),
       port(port),
@@ -2099,6 +2144,14 @@ VCoproc::MainLoop()
 	return err;
 }
 
+std::string &
+StrLower(std::string &s)
+{
+	std::transform(s.begin(), s.end(), s.begin(),
+		       [](unsigned char c) { return std::tolower(c); });
+	return s;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -2112,7 +2165,6 @@ main(int argc, char **argv)
 	std::string failed_dir;
 	std::string forward_dir;
 	std::string archive_dir;
-	std::string dbfile;
 	std::string source;
 	std::string host;
 	unsigned short port = 0;
@@ -2121,6 +2173,7 @@ main(int argc, char **argv)
 	bool consume	       = false;
 	bool monitor	       = false;
 	bool compress_archived = false;
+	struct DBSpec dbspec;
 	int opt, ret;
 
 	/*
@@ -2280,9 +2333,50 @@ main(int argc, char **argv)
 			}
 			break;
 
-		case 'D':
-			dbfile = std::string(optarg);
+		case 'D': {
+			/* Try to parse a connection string. */
+			std::string connstr = optarg;
+			std::regex e("([A-Za-z]+)=([^;]+);");
+			std::sregex_iterator rit(connstr.begin(), connstr.end(),
+						 e);
+			std::sregex_iterator rend;
+
+			if (rit != rend) {
+				for (; rit != rend; rit++) {
+					std::string key = (*rit)[1];
+					std::string val = (*rit)[2];
+					StrLower(key);
+					if (key == "server") {
+						dbspec.host = val;
+					} else if (key == "port") {
+						if (!Str2Num<unsigned short>(
+							val, dbspec.port)) {
+							std::cerr
+							    << "Invalid Port "
+							       "in connection "
+							       "string"
+							    << std::endl;
+							return -1;
+						}
+					} else if (key == "database") {
+						dbspec.dbname = val;
+					} else if (key == "uid") {
+						dbspec.user = val;
+					} else if (key == "pwd") {
+						dbspec.password = val;
+					} else if (key == "table") {
+						dbspec.tablename = val;
+					}
+				}
+				dbspec.Dump();
+			} else {
+				/* Not a connection string. Assume it's a sqlite
+				 * DB file. */
+				dbspec.dbfile = connstr;
+			}
+
 			break;
+		}
 
 		case 'H':
 			host = optarg;
@@ -2322,7 +2416,7 @@ main(int argc, char **argv)
 	    std::move(input_dirs), std::move(input_exts), std::move(output_dir),
 	    std::move(failed_dir), std::move(forward_dir),
 	    std::move(archive_dir), compress_archived, max_pending, dir_min_age,
-	    stats_period, retention_days, dbfile, host, port);
+	    stats_period, retention_days, std::move(dbspec), host, port);
 	if (vcoproc == nullptr) {
 		return -1;
 	}
