@@ -302,6 +302,14 @@ MySQLDbConn::Create(const DbSpec &dbspec)
 		return nullptr;
 	}
 
+	/* Note: autocommit is on by default. */
+
+	my_bool reconnect = 1;
+	if (mysql_options(dbc, MYSQL_OPT_RECONNECT, &reconnect)) {
+		std::cerr << logb(utils::LogWrn)
+			  << "Failed to set MYSQL_OPT_RECONNECT" << std::endl;
+	}
+
 	if (true) {
 		std::cout << "Connected to MySQL server "
 			  << mysql_get_server_info(dbc) << ", "
