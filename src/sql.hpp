@@ -111,6 +111,8 @@ class MySQLDbCursor : public DbCursor {
 class MySQLDbConn : public DbConn {
 	MYSQL *dbc = nullptr;
 
+	int QueryReconnect(const std::stringstream &ss, int verbose);
+
     public:
 	static std::unique_ptr<DbConn> Create(const DbSpec &dbspec);
 	MySQLDbConn(MYSQL *dbc) : dbc(dbc) {}

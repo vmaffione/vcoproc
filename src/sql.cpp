@@ -327,31 +327,56 @@ MySQLDbConn::~MySQLDbConn()
 }
 
 int
-MySQLDbConn::ModifyStmt(const std::stringstream &ss, int verbose)
+MySQLDbConn::QueryReconnect(const std::stringstream &ss, int verbose)
 {
 	if (verbose) {
 		std::cout << "Q: " << ss.str() << std::endl;
 	}
 
-	if (mysql_query(dbc, ss.str().c_str())) {
-		std::cerr << logb(LogErr)
-			  << "Query failed: " << mysql_error(dbc) << std::endl;
-		return -1;
+	for (int retry = 0; retry < 2; retry++) {
+		int ret = mysql_query(dbc, ss.str().c_str());
+
+		if (ret == 0) {
+			/* Query was successful. We can return. */
+			return 0;
+		}
+
+		if (retry > 0) {
+			/* Second query failure in a row. Give up. */
+			break;
+		}
+
+		/*
+		 * An error occurred, maybe because the connection with the
+		 * server went down. We therefore try to ping the server,
+		 * because a ping will trigger a reconnection (if needed).
+		 */
+		if (mysql_ping(dbc)) {
+			/* The reconnect failed. Give up. */
+			break;
+		}
+
+		/* We reconnected successfully. Retry the query again. */
 	}
 
-	return 0;
+	std::cerr << logb(LogErr) << "Query failed: " << mysql_error(dbc)
+		  << std::endl;
+
+	return -1;
+}
+
+int
+MySQLDbConn::ModifyStmt(const std::stringstream &ss, int verbose)
+{
+	return QueryReconnect(ss, verbose);
 }
 
 std::unique_ptr<DbCursor>
 MySQLDbConn::SelectStmt(const std::stringstream &ss, int verbose)
 {
-	if (verbose) {
-		std::cout << "Q: " << ss.str() << std::endl;
-	}
+	int ret = QueryReconnect(ss, verbose);
 
-	if (mysql_query(dbc, ss.str().c_str())) {
-		std::cerr << logb(LogErr)
-			  << "Query failed: " << mysql_error(dbc) << std::endl;
+	if (ret) {
 		return nullptr;
 	}
 
