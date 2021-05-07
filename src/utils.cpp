@@ -478,6 +478,66 @@ RemoveFile(const std::string &path, bool may_not_exist)
 	return 0;
 }
 
+std::unique_ptr<DirScanner>
+DirScanner::Create(const std::string &path, bool safe)
+{
+	DIR *dir = opendir(path.c_str());
+
+	if (dir == nullptr) {
+		std::cerr << logb(LogErr) << "Failed to opendir(" << path
+			  << "): " << strerror(errno) << std::endl;
+		return nullptr;
+	}
+
+	return std::make_unique<DirScanner>(dir, safe);
+}
+
+DirScanner::~DirScanner()
+{
+	if (dir) {
+		closedir(dir);
+		dir = nullptr;
+	}
+}
+
+bool
+DirScanner::DoNext(std::string &entry)
+{
+	struct dirent *dent;
+
+	while ((dent = readdir(dir)) != nullptr) {
+		if (strcmp(dent->d_name, ".") && strcmp(dent->d_name, "..")) {
+			entry = std::string(dent->d_name);
+			return true;
+		}
+	}
+
+	return false;
+}
+
+bool
+DirScanner::Next(std::string &entry)
+{
+	if (!safe) {
+		return DoNext(entry);
+	}
+
+	if (next_file_idx < 0) {
+		/* Pre-load. */
+		std::string file;
+
+		while (DoNext(file)) {
+			files.push_back(file);
+		}
+		next_file_idx = 0;
+	}
+	if (next_file_idx < static_cast<int>(files.size())) {
+		entry = files[next_file_idx++];
+		return true;
+	}
+	return false;
+}
+
 int
 ExecuteCommand(std::stringstream &cmdss, bool verbose, bool daemonize)
 {
@@ -725,64 +785,116 @@ IPAddr::StrNoPrefix() const
 	return repr.substr(0, slash);
 }
 
-std::unique_ptr<DirScanner>
-DirScanner::Create(const std::string &path, bool safe)
+std::string
+Base64Encode(const char *data, size_t in_len)
 {
-	DIR *dir = opendir(path.c_str());
+	static constexpr char kEncodingTable[] = {
+	    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
+	    'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
+	    'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm',
+	    'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
+	    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '+', '/'};
 
-	if (dir == nullptr) {
-		std::cerr << logb(LogErr) << "Failed to opendir(" << path
-			  << "): " << strerror(errno) << std::endl;
-		return nullptr;
+	size_t out_len = 4 * ((in_len + 2) / 3);
+	std::string ret(out_len, '\0');
+	char *p = const_cast<char *>(ret.c_str());
+	size_t i;
+
+	for (i = 0; i < in_len - 2; i += 3) {
+		*p++ = kEncodingTable[(data[i] >> 2) & 0x3F];
+		*p++ = kEncodingTable[((data[i] & 0x3) << 4) |
+				      ((int)(data[i + 1] & 0xF0) >> 4)];
+		*p++ = kEncodingTable[((data[i + 1] & 0xF) << 2) |
+				      ((int)(data[i + 2] & 0xC0) >> 6)];
+		*p++ = kEncodingTable[data[i + 2] & 0x3F];
 	}
-
-	return std::make_unique<DirScanner>(dir, safe);
-}
-
-DirScanner::~DirScanner()
-{
-	if (dir) {
-		closedir(dir);
-		dir = nullptr;
-	}
-}
-
-bool
-DirScanner::DoNext(std::string &entry)
-{
-	struct dirent *dent;
-
-	while ((dent = readdir(dir)) != nullptr) {
-		if (strcmp(dent->d_name, ".") && strcmp(dent->d_name, "..")) {
-			entry = std::string(dent->d_name);
-			return true;
+	if (i < in_len) {
+		*p++ = kEncodingTable[(data[i] >> 2) & 0x3F];
+		if (i == (in_len - 1)) {
+			*p++ = kEncodingTable[((data[i] & 0x3) << 4)];
+			*p++ = '=';
+		} else {
+			*p++ = kEncodingTable[((data[i] & 0x3) << 4) |
+					      ((int)(data[i + 1] & 0xF0) >> 4)];
+			*p++ = kEncodingTable[((data[i + 1] & 0xF) << 2)];
 		}
+		*p++ = '=';
 	}
 
-	return false;
+	return ret;
 }
 
-bool
-DirScanner::Next(std::string &entry)
+int
+Base64Decode(const char *input, size_t in_len, std::string &out)
 {
-	if (!safe) {
-		return DoNext(entry);
+	static constexpr unsigned char kDecodingTable[] = {
+	    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+	    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+	    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 62, 64, 64, 64, 63,
+	    52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 64, 64, 64, 64, 64, 64,
+	    64, 0,  1,	2,  3,	4,  5,	6,  7,	8,  9,	10, 11, 12, 13, 14,
+	    15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 64, 64, 64, 64, 64,
+	    64, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+	    41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 64, 64, 64, 64, 64,
+	    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+	    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+	    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+	    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+	    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+	    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+	    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64,
+	    64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64};
+
+	if (in_len % 4 != 0) {
+		return -1; /* Input data size is not a multiple of 4 */
 	}
 
-	if (next_file_idx < 0) {
-		/* Pre-load. */
-		std::string file;
+	size_t out_len = in_len / 4 * 3;
+	if (input[in_len - 1] == '=')
+		out_len--;
+	if (input[in_len - 2] == '=')
+		out_len--;
 
-		while (DoNext(file)) {
-			files.push_back(file);
-		}
-		next_file_idx = 0;
+	out.resize(out_len);
+
+	for (size_t i = 0, j = 0; i < in_len;) {
+		uint32_t a = input[i] == '='
+				 ? 0 & i++
+				 : kDecodingTable[static_cast<int>(input[i++])];
+		uint32_t b = input[i] == '='
+				 ? 0 & i++
+				 : kDecodingTable[static_cast<int>(input[i++])];
+		uint32_t c = input[i] == '='
+				 ? 0 & i++
+				 : kDecodingTable[static_cast<int>(input[i++])];
+		uint32_t d = input[i] == '='
+				 ? 0 & i++
+				 : kDecodingTable[static_cast<int>(input[i++])];
+
+		uint32_t triple =
+		    (a << 3 * 6) + (b << 2 * 6) + (c << 1 * 6) + (d << 0 * 6);
+
+		if (j < out_len)
+			out[j++] = (triple >> 2 * 8) & 0xFF;
+		if (j < out_len)
+			out[j++] = (triple >> 1 * 8) & 0xFF;
+		if (j < out_len)
+			out[j++] = (triple >> 0 * 8) & 0xFF;
 	}
-	if (next_file_idx < static_cast<int>(files.size())) {
-		entry = files[next_file_idx++];
-		return true;
-	}
-	return false;
+
+	return 0;
+}
+
+std::string
+Base64Encode(const std::string &src)
+{
+	return Base64Encode(src.c_str(), src.size());
+}
+
+int
+Base64Decode(const std::string &enc, std::string &result)
+{
+	return Base64Decode(enc.data(), enc.size(), result);
 }
 
 } // namespace utils

@@ -1,5 +1,5 @@
 /*
- * Author: Vincenzo M. (2020)
+ * Author: Vincenzo M. (2020-2021)
  */
 
 #ifndef __UTILS_HPP__
@@ -15,13 +15,20 @@
 
 namespace utils {
 
+/*
+ * Logging.
+ */
 enum {
 	LogErr = 0,
 	LogWrn,
 	LogInf,
 	LogDbg,
 };
+std::string logb(int loglevel);
 
+/*
+ * Files, directories and paths.
+ */
 bool DirExists(const char *path);
 bool DirExists(const std::string &s);
 bool DirEmpty(const std::string &dirpath);
@@ -46,24 +53,44 @@ std::string PathJoin(const std::string &dirpath, const std::string &name);
 int MkdirIfNotExists(const std::string &path);
 std::string JoinStrings(const std::vector<std::string> &strings,
 			const std::string &delim);
-std::string &StrLower(std::string &s);
 int CopyFile(const std::string &dstname, const std::string &srcname);
 int CopyToDir(const std::string &dir, const std::string &srcname);
 int MoveToDir(const std::string &dir, const std::string &src);
 int RemoveFile(const std::string &path, bool may_not_exist = false);
 
+class DirScanner {
+	DIR *dir  = nullptr;
+	bool safe = false;
+	/* List of files, to be used in case safe = true. */
+	std::vector<std::string> files;
+	int next_file_idx = -1;
+
+	bool DoNext(std::string &entry);
+
+    public:
+	static std::unique_ptr<DirScanner> Create(const std::string &path,
+						  bool safe = false);
+	DirScanner(DIR *d, bool safe) : dir(d), safe(safe) {}
+	~DirScanner();
+	bool Next(std::string &entry);
+};
+
+/*
+ * Command execution.
+ */
 int ExecuteCommand(std::stringstream &cmdss, bool verbose = false,
 		   bool daemonize = false);
 int ExecuteCommand(const std::string &cmdstring, bool verbose = false,
 		   bool daemonize = false);
 
+/*
+ * File descriptors and eventfd.
+ * UniqueFd is an helper class to manage file descriptors with RAII.
+ */
 int FdSetBlocking(int fd, bool blocking);
 int EventFdSignal(int efd);
 int EventFdDrain(int efd);
 
-std::string logb(int loglevel);
-
-/* Helper class to manage file descriptors with RAII. */
 class UniqueFd {
 	int fd = -1;
 
@@ -106,6 +133,9 @@ class UniqueFd {
 	}
 };
 
+/*
+ * Strings helpers, including conversion between strings and numbers.
+ */
 template <class T, bool HEX = false>
 bool
 Str2Num(const std::string &s, T &num)
@@ -135,6 +165,16 @@ Num2Str(T num)
 
 	return oss.str();
 }
+
+std::string &StrLower(std::string &s);
+
+/*
+ * Base64 encoding and decoding.
+ */
+std::string Base64Encode(const char *data, size_t in_len);
+std::string Base64Encode(const std::string &src);
+int Base64Decode(const char *input, size_t in_len, std::string &out);
+int Base64Decode(const std::string &enc, std::string &result);
 
 struct IPAddr {
 	std::string repr;
@@ -170,23 +210,6 @@ struct IPAddr {
 
 	std::string StrNoPrefix() const;
 	operator std::string() const { return repr; }
-};
-
-class DirScanner {
-	DIR *dir  = nullptr;
-	bool safe = false;
-	/* List of files, to be used in case safe = true. */
-	std::vector<std::string> files;
-	int next_file_idx = -1;
-
-	bool DoNext(std::string &entry);
-
-    public:
-	static std::unique_ptr<DirScanner> Create(const std::string &path,
-						  bool safe = false);
-	DirScanner(DIR *d, bool safe) : dir(d), safe(safe) {}
-	~DirScanner();
-	bool Next(std::string &entry);
 };
 
 } // namespace utils
