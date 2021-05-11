@@ -290,9 +290,10 @@ logb(int loglevel)
 }
 
 std::string
-PathJoin(const std::string &dirpath, const std::string &name)
+PathJoin(const std::string &dirpath, const std::string &name,
+	 bool preserve_path)
 {
-	std::string basename = FileBaseName(name);
+	std::string basename = preserve_path ? name : FileBaseName(name);
 
 	if (dirpath.empty()) {
 		return basename;

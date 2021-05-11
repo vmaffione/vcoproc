@@ -49,7 +49,8 @@ bool FileHasAnyExtension(const std::string &filename,
 			 const std::vector<std::string> &exts);
 std::string PathNameNoExt(const std::string &path);
 std::string PathNameNewExt(const std::string &path, std::string new_ext);
-std::string PathJoin(const std::string &dirpath, const std::string &name);
+std::string PathJoin(const std::string &dirpath, const std::string &name,
+		     bool preserve_path = false);
 int MkdirIfNotExists(const std::string &path);
 std::string JoinStrings(const std::vector<std::string> &strings,
 			const std::string &delim);
