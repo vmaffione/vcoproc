@@ -6,6 +6,7 @@
 #define __UTILS_HPP__
 
 #include <arpa/inet.h>
+#include <chrono>
 #include <dirent.h>
 #include <string>
 #include <sstream>
@@ -133,6 +134,9 @@ class UniqueFd {
 		}
 	}
 };
+
+float MsecsElapsed(std::chrono::time_point<std::chrono::system_clock> tstart);
+float SecsElapsed(std::chrono::time_point<std::chrono::system_clock> tstart);
 
 /*
  * Strings helpers, including conversion between strings and numbers.

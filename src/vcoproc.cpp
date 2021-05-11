@@ -85,22 +85,6 @@ PrintVersionInfo()
 		  << "    build date       : " << VC_REVISION_DATE << std::endl;
 }
 
-float
-MsecsElapsed(std::chrono::time_point<std::chrono::system_clock> tstart)
-{
-	auto tend  = std::chrono::system_clock::now();
-	auto usecs = std::chrono::duration_cast<std::chrono::microseconds>(
-	    tend - tstart);
-
-	return usecs.count() / 1000.0;
-}
-
-float
-SecsElapsed(std::chrono::time_point<std::chrono::system_clock> tstart)
-{
-	return MsecsElapsed(tstart) / 1000.0;
-}
-
 UniqueFd stopfd_global;
 
 void

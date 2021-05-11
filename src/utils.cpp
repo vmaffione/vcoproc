@@ -898,4 +898,20 @@ Base64Decode(const std::string &enc, std::string &result)
 	return Base64Decode(enc.data(), enc.size(), result);
 }
 
+float
+MsecsElapsed(std::chrono::time_point<std::chrono::system_clock> tstart)
+{
+	auto tend  = std::chrono::system_clock::now();
+	auto usecs = std::chrono::duration_cast<std::chrono::microseconds>(
+	    tend - tstart);
+
+	return usecs.count() / 1000.0;
+}
+
+float
+SecsElapsed(std::chrono::time_point<std::chrono::system_clock> tstart)
+{
+	return MsecsElapsed(tstart) / 1000.0;
+}
+
 } // namespace utils
