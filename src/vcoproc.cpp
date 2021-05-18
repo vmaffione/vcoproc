@@ -441,14 +441,14 @@ PendingFile::RetirePostCurl(std::string &respstr)
 	return 0;
 }
 
-class PsBackend : public Backend {
+class LibraryBackend : public Backend {
 	std::string int_url;
 	std::string bat_url;
 
     public:
 	static std::unique_ptr<Backend> Create(std::string host,
 					       unsigned short port);
-	PsBackend(std::string host, unsigned short port);
+	LibraryBackend(std::string host, unsigned short port);
 	virtual bool Probe();
 	std::unique_ptr<BackendTransaction> CreateTransaction(
 	    const std::string &filepath);
@@ -456,8 +456,8 @@ class PsBackend : public Backend {
 	std::string BatchURL() const { return bat_url; }
 };
 
-class PsBackendTransaction : public BackendTransaction {
-	PsBackend *be = nullptr;
+class LibraryBackendTransaction : public BackendTransaction {
+	LibraryBackend *be = nullptr;
 	std::string filepath;
 	enum class State {
 		Init	       = 0,
@@ -473,8 +473,8 @@ class PsBackendTransaction : public BackendTransaction {
 #endif
 
     public:
-	PsBackendTransaction(Backend *be, const std::string &filepath)
-	    : be(dynamic_cast<PsBackend *>(be)), filepath(filepath)
+	LibraryBackendTransaction(Backend *be, const std::string &filepath)
+	    : be(dynamic_cast<LibraryBackend *>(be)), filepath(filepath)
 	{
 		assert(this->be != nullptr);
 	}
@@ -483,7 +483,7 @@ class PsBackendTransaction : public BackendTransaction {
 };
 
 int
-PsBackendTransaction::PrepareRequest(std::string &url, std::string &req)
+LibraryBackendTransaction::PrepareRequest(std::string &url, std::string &req)
 {
 	json11::Json jsreq;
 
@@ -517,8 +517,8 @@ PsBackendTransaction::PrepareRequest(std::string &url, std::string &req)
 }
 
 int
-PsBackendTransaction::ProcessResponse(std::string &resp,
-				      json11::Json::object &jout)
+LibraryBackendTransaction::ProcessResponse(std::string &resp,
+					   json11::Json::object &jout)
 {
 	std::string errs;
 	json11::Json jsresp = json11::Json::parse(resp, errs);
@@ -555,12 +555,12 @@ PsBackendTransaction::ProcessResponse(std::string &resp,
 }
 
 std::unique_ptr<Backend>
-PsBackend::Create(std::string host, unsigned short port)
+LibraryBackend::Create(std::string host, unsigned short port)
 {
-	return std::make_unique<PsBackend>(host, port);
+	return std::make_unique<LibraryBackend>(host, port);
 }
 
-PsBackend::PsBackend(std::string host, unsigned short port)
+LibraryBackend::LibraryBackend(std::string host, unsigned short port)
 {
 	std::stringstream ss;
 
@@ -573,7 +573,7 @@ PsBackend::PsBackend(std::string host, unsigned short port)
 }
 
 bool
-PsBackend::Probe()
+LibraryBackend::Probe()
 {
 	std::string url = InteractiveURL() + std::string("/ping");
 	long http_code	= 0;
@@ -652,9 +652,9 @@ end:
 }
 
 std::unique_ptr<BackendTransaction>
-PsBackend::CreateTransaction(const std::string &filepath)
+LibraryBackend::CreateTransaction(const std::string &filepath)
 {
-	return std::make_unique<PsBackendTransaction>(this, filepath);
+	return std::make_unique<LibraryBackendTransaction>(this, filepath);
 }
 
 /* Main class. */
@@ -881,7 +881,7 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		consume = true;
 	}
 
-	auto be = PsBackend::Create(host, port);
+	auto be = LibraryBackend::Create(host, port);
 	if (be == nullptr) {
 		std::cerr << logb(LogErr) << "Failed to create backend"
 			  << std::endl;
