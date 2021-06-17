@@ -692,7 +692,7 @@ class VCoproc {
 	 * Statistics update period in seconds, and retention days.
 	 */
 	unsigned int stats_period   = 300;
-	unsigned int retention_days = 7;
+	unsigned int retention_days = 60;
 
 	struct DbSpec dbspec;
 	std::unique_ptr<DbConn> dbconn;
@@ -1916,7 +1916,7 @@ main(int argc, char **argv)
 	unsigned short max_pending  = 5;
 	unsigned short dir_min_age  = 0;
 	unsigned int stats_period   = 300;
-	unsigned int retention_days = 7;
+	unsigned int retention_days = 60;
 	std::string output_dir;
 	std::string failed_dir;
 	std::string forward_dir;
