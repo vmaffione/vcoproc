@@ -761,6 +761,7 @@ class VCoproc {
 	void PreProcessNewFiles();
 	void PreparePostRequests();
 	bool RetireAndProcessPostResponses();
+	void FinalizeOutput(PendingFile *pf, bool success);
 	void TimeoutWaitingRequests();
 	void PostProcessFiles();
 	void CleanupCompletedFiles();
@@ -1256,7 +1257,21 @@ VCoproc::PreProcessNewFiles()
 				break;
 			}
 		}
-		SetPendingFileState(pf, PendState::ReadyToSubmit);
+
+		if (FileSize(pf->FilePath()) == 0) {
+			/*
+			 * If the file is empty, don't even bother processing
+			 * it.
+			 */
+			pf->jout["asr"] = "vcoproc";
+			pf->jout["asr_version"] = VC_VERSION;
+			pf->jout["status"]     = "NOMETADATA";
+			pf->jout["length"]     = 0.0;
+			pf->jout["net_speech"] = 0.0;
+			FinalizeOutput(pf.get(), /*success=*/true);
+		} else {
+			SetPendingFileState(pf, PendState::ReadyToSubmit);
+		}
 		progress++;
 	}
 }
@@ -1354,13 +1369,6 @@ VCoproc::RetireAndProcessPostResponses()
 			success = r > 0;
 		}
 
-		/*
-		 * Transaction is complete. Finalize and output
-		 * the JSON.
-		 */
-		double audio_len  = 0;
-		double speech_len = 0;
-
 		if (verbose) {
 			std::cout << logb(LogDbg) << "Processed "
 				  << pf->FileName() << " --> " << http_code
@@ -1368,63 +1376,74 @@ VCoproc::RetireAndProcessPostResponses()
 				  << std::endl;
 		}
 
-		if (!pf->jout.count("status")) {
-			std::cerr << logb(LogErr) << "Missing status key"
-				  << std::endl;
-			success = false;
-		} else {
-			success = (pf->jout["status"] == "COMPLETE") ||
-				  (pf->jout["status"] == "NOMETADATA");
-		}
-
-		if (pf->jout.count("length") &&
-		    pf->jout["length"].is_number()) {
-			audio_len = pf->jout["length"].number_value();
-		}
-		if (pf->jout.count("net_speech") &&
-		    pf->jout["net_speech"].is_number()) {
-			speech_len = pf->jout["net_speech"].number_value();
-		}
-
-		if (success) {
-			/* Output JSON. */
-			std::string jsname = pf->FileName();
-			std::string jspath;
-
-			pf->jout["origin"] = source;
-
-			json11::Json jmdata = pf->GetMetadata();
-			if (jmdata != json11::Json()) {
-				pf->jout["metadata"] = jmdata;
-			}
-
-			jsname = PathNameNewExt(jsname, "json");
-			jspath = PathJoin(output_dir, jsname);
-			std::ofstream fout(jspath);
-			fout << json11::Json(pf->jout).dump();
-			fout << std::endl;
-		}
-
-		if (!success) {
-			SetPendingFileState(pf, PendState::ProcFailure);
-			stats.files_failed++;
-			stats.bytes_failed += pf->FileSize();
-		} else {
-			SetPendingFileState(pf, PendState::ProcSuccess);
-			if (pf->jout["status"] == "COMPLETE") {
-				stats.files_scored++;
-				stats.bytes_scored += pf->FileSize();
-				stats.audiosec_scored += audio_len;
-				stats.speechsec_scored += speech_len;
-			} else {
-				stats.files_nomdata++;
-				stats.bytes_nomdata += pf->FileSize();
-				stats.audiosec_nomdata += audio_len;
-			}
-		}
+		/*
+		 * Transaction is complete. Finalize and output
+		 * the JSON.
+		 */
+		FinalizeOutput(pf, success);
 	}
 
 	return true;
+}
+
+void
+VCoproc::FinalizeOutput(PendingFile *pf, bool success)
+{
+	double audio_len  = 0;
+	double speech_len = 0;
+
+	if (!pf->jout.count("status")) {
+		std::cerr << logb(LogErr) << "Missing status key" << std::endl;
+		success = false;
+	} else {
+		success = (pf->jout["status"] == "COMPLETE") ||
+			  (pf->jout["status"] == "NOMETADATA");
+	}
+
+	if (pf->jout.count("length") && pf->jout["length"].is_number()) {
+		audio_len = pf->jout["length"].number_value();
+	}
+	if (pf->jout.count("net_speech") &&
+	    pf->jout["net_speech"].is_number()) {
+		speech_len = pf->jout["net_speech"].number_value();
+	}
+
+	if (success) {
+		/* Output JSON. */
+		std::string jsname = pf->FileName();
+		std::string jspath;
+
+		pf->jout["origin"] = source;
+
+		json11::Json jmdata = pf->GetMetadata();
+		if (jmdata != json11::Json()) {
+			pf->jout["metadata"] = jmdata;
+		}
+
+		jsname = PathNameNewExt(jsname, "json");
+		jspath = PathJoin(output_dir, jsname);
+		std::ofstream fout(jspath);
+		fout << json11::Json(pf->jout).dump();
+		fout << std::endl;
+	}
+
+	if (!success) {
+		SetPendingFileState(pf, PendState::ProcFailure);
+		stats.files_failed++;
+		stats.bytes_failed += pf->FileSize();
+	} else {
+		SetPendingFileState(pf, PendState::ProcSuccess);
+		if (pf->jout["status"] == "COMPLETE") {
+			stats.files_scored++;
+			stats.bytes_scored += pf->FileSize();
+			stats.audiosec_scored += audio_len;
+			stats.speechsec_scored += speech_len;
+		} else {
+			stats.files_nomdata++;
+			stats.bytes_nomdata += pf->FileSize();
+			stats.audiosec_nomdata += audio_len;
+		}
+	}
 }
 
 void
