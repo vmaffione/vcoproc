@@ -61,6 +61,9 @@ Usage(const char *progname)
 	    << "    -n MAX_PENDING_TRANSACTIONS (max number of concurrent "
 	       "processing transactions)"
 	    << std::endl
+	    << "    -t TIMEOUT_SECS (timeout for each POST request; defaults "
+	       "to 120)"
+	    << std::endl
 	    << "    -A DIR_MIN_AGE (minimum age, in seconds, of empty "
 	       "directories to be removed; defaults to 0)"
 	    << std::endl
@@ -709,6 +712,12 @@ class VCoproc {
 	unsigned short max_pending = 5;
 
 	/*
+	 * Maximum period of inactivity for a given pending file before
+	 * we decide it timed out.
+	 */
+	unsigned short timeout_secs = 120;
+
+	/*
 	 * Minimum age of an empty input subdirectory to be elegible
 	 * for removal. This is useful for those cases where the
 	 * producer creates visible directories before filling
@@ -797,9 +806,10 @@ class VCoproc {
 	    std::vector<std::string> input_exts, std::string output_dir,
 	    std::string failed_dir, std::string forward_dir,
 	    std::string archive_dir, bool compress_archived,
-	    unsigned short max_pending, unsigned short dir_min_age,
-	    unsigned int stats_period, unsigned int retention_days,
-	    struct DbSpec dbspec, std::string host, unsigned short port);
+	    unsigned short max_pending, unsigned short timeout_secs,
+	    unsigned short dir_min_age, unsigned int stats_period,
+	    unsigned int retention_days, struct DbSpec dbspec, std::string host,
+	    unsigned short port);
 
 	VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend>, int verbose,
 		bool consume, bool monitor, std::string source,
@@ -807,10 +817,11 @@ class VCoproc {
 		std::vector<std::string> input_exts, std::string output_dir,
 		std::string failed_dir, std::string forward_dir,
 		std::string archive_dir, bool compress_archived,
-		unsigned short max_pending, unsigned short dir_min_age,
-		unsigned int stats_period, unsigned int retention_days,
-		struct DbSpec dbspec, std::unique_ptr<DbConn> dbconn,
-		std::string host, unsigned short port);
+		unsigned short max_pending, unsigned short timeout_secs,
+		unsigned short dir_min_age, unsigned int stats_period,
+		unsigned int retention_days, struct DbSpec dbspec,
+		std::unique_ptr<DbConn> dbconn, std::string host,
+		unsigned short port);
 	~VCoproc();
 	int MainLoop();
 };
@@ -821,9 +832,10 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		std::vector<std::string> input_exts, std::string output_dir,
 		std::string failed_dir, std::string forward_dir,
 		std::string archive_dir, bool compress_archived,
-		unsigned short max_pending, unsigned short dir_min_age,
-		unsigned int stats_period, unsigned int retention_days,
-		struct DbSpec dbspec, std::string host, unsigned short port)
+		unsigned short max_pending, unsigned short timeout_secs,
+		unsigned short dir_min_age, unsigned int stats_period,
+		unsigned int retention_days, struct DbSpec dbspec,
+		std::string host, unsigned short port)
 {
 	if (source.empty()) {
 		std::cerr << logb(LogErr) << "No source/origin specified (-s)"
@@ -857,6 +869,12 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		std::cerr << logb(LogErr)
 			  << "Number of max pending "
 			     "transactions out of range"
+			  << std::endl;
+		return nullptr;
+	}
+
+	if (timeout_secs < 1 || timeout_secs > 300) {
+		std::cerr << logb(LogErr) << "Timeout seconds out of range"
 			  << std::endl;
 		return nullptr;
 	}
@@ -992,8 +1010,9 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 	    std::move(source), std::move(input_dirs), std::move(input_exts),
 	    std::move(output_dir), std::move(failed_dir),
 	    std::move(forward_dir), std::move(archive_dir), compress_archived,
-	    max_pending, dir_min_age, stats_period, retention_days,
-	    std::move(dbspec), std::move(dbconn), std::move(host), port);
+	    max_pending, timeout_secs, dir_min_age, stats_period,
+	    retention_days, std::move(dbspec), std::move(dbconn),
+	    std::move(host), port);
 }
 
 VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
@@ -1002,10 +1021,11 @@ VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
 		 std::vector<std::string> input_exts, std::string output_dir,
 		 std::string failed_dir, std::string forward_dir,
 		 std::string archive_dir, bool compress_archived,
-		 unsigned short max_pending, unsigned short dir_min_age,
-		 unsigned int stats_period, unsigned int retention_days,
-		 struct DbSpec dbspec, std::unique_ptr<DbConn> dbconn,
-		 std::string host, unsigned short port)
+		 unsigned short max_pending, unsigned short timeout_secs,
+		 unsigned short dir_min_age, unsigned int stats_period,
+		 unsigned int retention_days, struct DbSpec dbspec,
+		 std::unique_ptr<DbConn> dbconn, std::string host,
+		 unsigned short port)
     : stopfd(stopfd),
       curlm(curlm),
       be(std::move(be)),
@@ -1021,6 +1041,7 @@ VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
       archive_dir(std::move(archive_dir)),
       compress_archived(compress_archived),
       max_pending(max_pending),
+      timeout_secs(timeout_secs),
       dir_min_age(dir_min_age),
       stats_period(stats_period),
       retention_days(retention_days),
@@ -1602,7 +1623,8 @@ VCoproc::TimeoutWaitingRequests()
 		auto &pf = kv.second;
 
 		if (pf->State() == PendState::WaitingResponse &&
-		    pf->InactivitySeconds() > 120.0) {
+		    pf->InactivitySeconds() >
+			static_cast<float>(timeout_secs)) {
 			std::cerr << logb(LogErr) << "File " << pf->FileName()
 				  << " timed out" << std::endl;
 			if (pf->bt->Retry() < 2) {
@@ -1964,6 +1986,7 @@ main(int argc, char **argv)
 	std::vector<std::string> input_dirs;
 	std::vector<std::string> input_exts;
 	unsigned short max_pending  = 5;
+	unsigned short timeout_secs = 120;
 	unsigned short dir_min_age  = 0;
 	unsigned int stats_period   = 300;
 	unsigned int retention_days = 60;
@@ -2017,7 +2040,7 @@ main(int argc, char **argv)
 	}
 
 	while ((opt = getopt(argc, argv,
-			     "hVvi:o:F:f:a:CcmD:H:p:s:e:n:T:R:A:")) != -1) {
+			     "hVvi:o:F:f:a:CcmD:H:p:s:e:n:T:R:A:t:")) != -1) {
 		switch (opt) {
 		case 'h':
 			Usage(argv[0]);
@@ -2209,6 +2232,16 @@ main(int argc, char **argv)
 			input_exts.push_back(ext);
 			break;
 		}
+
+		case 't':
+			if (!Str2Num<unsigned short>(optarg, timeout_secs)) {
+				std::cerr << logb(LogErr)
+					  << "Invalid value for -t: " << optarg
+					  << std::endl;
+				return -1;
+			}
+			break;
+
 		default:
 			return -1;
 			break;
@@ -2221,8 +2254,9 @@ main(int argc, char **argv)
 	    stopfd_global, verbose, consume, monitor, std::move(source),
 	    std::move(input_dirs), std::move(input_exts), std::move(output_dir),
 	    std::move(failed_dir), std::move(forward_dir),
-	    std::move(archive_dir), compress_archived, max_pending, dir_min_age,
-	    stats_period, retention_days, std::move(dbspec), host, port);
+	    std::move(archive_dir), compress_archived, max_pending,
+	    timeout_secs, dir_min_age, stats_period, retention_days,
+	    std::move(dbspec), host, port);
 	if (vcoproc == nullptr) {
 		return -1;
 	}
