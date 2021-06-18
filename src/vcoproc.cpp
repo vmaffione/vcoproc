@@ -1865,7 +1865,7 @@ VCoproc::MainLoop()
 		int timeout_ms = (AnyImmediateAction() ||
 				  (num_running_curls == 0 && more_files))
 				     ? 0
-				     : 5000;
+				     : std::min(5000, timeout_secs * 1000);
 		struct curl_waitfd wfd[1];
 		wfd[0].fd      = stopfd;
 		wfd[0].events  = CURL_WAIT_POLLIN;
