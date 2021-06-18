@@ -732,14 +732,6 @@ class VCoproc {
 	 */
 	bool bail_out = false;
 
-	/*
-	 * Incremented by the MainLoop anytime there is some
-	 * activity. If an iteration completes without any
-	 * activity, we allow one more iteration before
-	 * stopping, because more files may be available.
-	 */
-	int progress = 0;
-
 	struct {
 		uint64_t files_scored	 = 0;
 		uint64_t bytes_scored	 = 0;
@@ -1309,7 +1301,6 @@ VCoproc::PreProcessNewFiles()
 		} else {
 			SetPendingFileState(pf, PendState::ReadyToSubmit);
 		}
-		progress++;
 	}
 }
 
@@ -1322,8 +1313,6 @@ VCoproc::PreparePostRequests()
 		if (pf->State() != PendState::ReadyToSubmit) {
 			continue;
 		}
-
-		progress++;
 
 		std::string req;
 		std::string url;
@@ -1377,8 +1366,6 @@ VCoproc::RetireAndProcessPostResponses()
 				  << curl_easy_strerror(cc) << std::endl;
 			http_code = 400;
 		}
-
-		progress++;
 
 		if (http_code == 0) {
 			/*
@@ -1500,7 +1487,6 @@ VCoproc::CleanupCompletedFiles()
 					  << pf->FileName() << std::endl;
 			}
 			it = pending.erase(it);
-			progress++;
 		} else {
 			++it;
 		}
@@ -1601,7 +1587,6 @@ VCoproc::PostProcessFiles()
 		stats.procsec_completed += pf->AgeSeconds();
 
 		SetPendingFileState(pf, PendState::Complete);
-		progress++;
 	}
 }
 
@@ -1614,7 +1599,6 @@ VCoproc::TimeoutWaitingRequests()
 		if (pf->State() == PendState::WaitingResponse &&
 		    pf->InactivitySeconds() > 120.0) {
 			pf->SetTimeoutState();
-			progress++;
 			std::cerr << logb(LogErr) << "File " << pf->FileName()
 				  << " timed out" << std::endl;
 			if (pf->State() == PendState::TimeoutRetry) {
