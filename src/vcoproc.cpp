@@ -110,7 +110,7 @@ class Backend {
     public:
 	virtual bool Probe() = 0;
 	virtual std::unique_ptr<BackendTransaction> CreateTransaction(
-	    const std::string &filepath) = 0;
+	    const std::string &filepath, bool retry = false) = 0;
 };
 
 enum class PendState {
@@ -120,6 +120,7 @@ enum class PendState {
 	ProcSuccess	= 3,
 	ProcFailure	= 4,
 	Complete	= 5,
+	TimeoutRetry	= 6,
 };
 
 /*
@@ -140,6 +141,8 @@ class PendingFile {
 	std::string src_path; /* file path */
 	size_t src_size = 0;  /* file size in bytes */
 	int verbose	= 0;
+
+	int timeout_retries = 2;
 
 	/* Temporary storage for the current CURL request body. */
 	std::string postreq;
@@ -186,6 +189,7 @@ class PendingFile {
 	PendState State() const { return state; }
 	std::string StateStr() const;
 	void SetState(PendState state);
+	void SetTimeoutState();
 	std::string FilePath() const { return src_path; }
 	std::string FileName() const { return FileBaseName(src_path); }
 	size_t FileSize() const { return src_size; }
@@ -285,9 +289,21 @@ PendingFile::StateStr() const
 		return "ProcFailure";
 	case PendState::Complete:
 		return "Complete";
+	case PendState::TimeoutRetry:
+		return "TimeoutRetry";
 	}
 
 	return std::string();
+}
+
+void
+PendingFile::SetTimeoutState()
+{
+	if (--timeout_retries >= 0) {
+		SetState(PendState::TimeoutRetry);
+	} else {
+		SetState(PendState::ProcFailure);
+	}
 }
 
 int
@@ -451,7 +467,7 @@ class LibraryBackend : public Backend {
 	LibraryBackend(std::string host, unsigned short port);
 	virtual bool Probe();
 	std::unique_ptr<BackendTransaction> CreateTransaction(
-	    const std::string &filepath);
+	    const std::string &filepath, bool retry);
 	std::string InteractiveURL() const { return int_url; }
 	std::string BatchURL() const { return bat_url; }
 };
@@ -459,6 +475,7 @@ class LibraryBackend : public Backend {
 class LibraryBackendTransaction : public BackendTransaction {
 	LibraryBackend *be = nullptr;
 	std::string filepath;
+	bool retry = false;
 	enum class State {
 		Init	       = 0,
 		WaitForPing    = 1,
@@ -473,8 +490,11 @@ class LibraryBackendTransaction : public BackendTransaction {
 #endif
 
     public:
-	LibraryBackendTransaction(Backend *be, const std::string &filepath)
-	    : be(dynamic_cast<LibraryBackend *>(be)), filepath(filepath)
+	LibraryBackendTransaction(Backend *be, const std::string &filepath,
+				  bool retry)
+	    : be(dynamic_cast<LibraryBackend *>(be)),
+	      filepath(filepath),
+	      retry(retry)
 	{
 		assert(this->be != nullptr);
 	}
@@ -485,7 +505,7 @@ class LibraryBackendTransaction : public BackendTransaction {
 int
 LibraryBackendTransaction::PrepareRequest(std::string &url, std::string &req)
 {
-	json11::Json jsreq;
+	json11::Json::object jsreq;
 
 	switch (state) {
 	case State::Init: {
@@ -495,10 +515,12 @@ LibraryBackendTransaction::PrepareRequest(std::string &url, std::string &req)
 	}
 
 	case State::ReadyToProcess: {
-		url   = be->BatchURL() + "/process";
-		jsreq = json11::Json::object{
-		    {"file_name", filepath},
-		};
+		url		   = be->BatchURL() + "/process";
+		jsreq["file_name"] = filepath;
+		if (retry) {
+			/* Disable STT if this is a retry. */
+			jsreq["stt_mode"] = "";
+		}
 		state = State::WaitForProcess;
 		break;
 	}
@@ -511,7 +533,7 @@ LibraryBackendTransaction::PrepareRequest(std::string &url, std::string &req)
 		break;
 	}
 
-	req = jsreq.dump();
+	req = json11::Json(jsreq).dump();
 
 	return 0;
 }
@@ -652,9 +674,10 @@ end:
 }
 
 std::unique_ptr<BackendTransaction>
-LibraryBackend::CreateTransaction(const std::string &filepath)
+LibraryBackend::CreateTransaction(const std::string &filepath, bool retry)
 {
-	return std::make_unique<LibraryBackendTransaction>(this, filepath);
+	return std::make_unique<LibraryBackendTransaction>(this, filepath,
+							   retry);
 }
 
 /* Main class. */
@@ -1242,6 +1265,20 @@ VCoproc::PreProcessNewFiles()
 	for (auto &kv : pending) {
 		auto &pf = kv.second;
 
+		/* Retry to process this file after the timeout. */
+		if (pf->State() == PendState::TimeoutRetry) {
+			pf = std::move(PendingFile::Create(
+			    std::move(be->CreateTransaction(pf->FilePath(),
+							    /*retry=*/true)),
+			    curlm, pf->FilePath(), verbose));
+			if (verbose) {
+				std::cout << logb(LogDbg)
+					  << "Reprocessing file "
+					  << pf->FileName() << std::endl;
+			}
+			continue;
+		}
+
 		if (pf->State() != PendState::New) {
 			continue;
 		}
@@ -1258,16 +1295,16 @@ VCoproc::PreProcessNewFiles()
 			}
 		}
 
-		if (FileSize(pf->FilePath()) == 0) {
+		if (utils::FileSize(pf->FilePath()) == 0) {
 			/*
 			 * If the file is empty, don't even bother processing
 			 * it.
 			 */
-			pf->jout["asr"] = "vcoproc";
+			pf->jout["asr"]		= "vcoproc";
 			pf->jout["asr_version"] = VC_VERSION;
-			pf->jout["status"]     = "NOMETADATA";
-			pf->jout["length"]     = 0.0;
-			pf->jout["net_speech"] = 0.0;
+			pf->jout["status"]	= "NOMETADATA";
+			pf->jout["length"]	= 0.0;
+			pf->jout["net_speech"]	= 0.0;
 			FinalizeOutput(pf.get(), /*success=*/true);
 		} else {
 			SetPendingFileState(pf, PendState::ReadyToSubmit);
@@ -1576,14 +1613,17 @@ VCoproc::TimeoutWaitingRequests()
 
 		if (pf->State() == PendState::WaitingResponse &&
 		    pf->InactivitySeconds() > 120.0) {
-			SetPendingFileState(pf, PendState::ProcFailure);
+			pf->SetTimeoutState();
 			progress++;
 			std::cerr << logb(LogErr) << "File " << pf->FileName()
 				  << " timed out" << std::endl;
-			stats.files_failed++;
-			stats.bytes_failed += pf->FileSize();
-			stats.files_timedout++;
-			stats.bytes_timedout += pf->FileSize();
+			if (pf->State() == PendState::TimeoutRetry) {
+				stats.files_timedout++;
+				stats.bytes_timedout += pf->FileSize();
+			} else { /* PendState::ProcFailure */
+				stats.files_failed++;
+				stats.bytes_failed += pf->FileSize();
+			}
 		}
 	}
 }
