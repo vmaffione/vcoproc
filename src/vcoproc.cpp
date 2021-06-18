@@ -100,7 +100,11 @@ SigintHandler(int signum)
 } // namespace
 
 class BackendTransaction {
+	int retry = 0;
+
     public:
+	BackendTransaction(int retry) : retry(retry) {}
+	int Retry() const { return retry; }
 	virtual int PrepareRequest(std::string &url, std::string &req) = 0;
 	virtual int ProcessResponse(std::string &resp,
 				    json11::Json::object &jout)	       = 0;
@@ -110,7 +114,7 @@ class Backend {
     public:
 	virtual bool Probe() = 0;
 	virtual std::unique_ptr<BackendTransaction> CreateTransaction(
-	    const std::string &filepath, bool retry = false) = 0;
+	    const std::string &filepath, int retry = 0) = 0;
 };
 
 enum class PendState {
@@ -141,8 +145,6 @@ class PendingFile {
 	std::string src_path; /* file path */
 	size_t src_size = 0;  /* file size in bytes */
 	int verbose	= 0;
-
-	int timeout_retries = 2;
 
 	/* Temporary storage for the current CURL request body. */
 	std::string postreq;
@@ -189,7 +191,6 @@ class PendingFile {
 	PendState State() const { return state; }
 	std::string StateStr() const;
 	void SetState(PendState state);
-	void SetTimeoutState();
 	std::string FilePath() const { return src_path; }
 	std::string FileName() const { return FileBaseName(src_path); }
 	size_t FileSize() const { return src_size; }
@@ -269,6 +270,21 @@ PendingFile::~PendingFile()
 	}
 
 	if (curl != nullptr) {
+		/*
+		 * Remove the easy handle from the multi handle. This is
+		 * necessary in case the easy handle was not removed by
+		 * RetirePostCurl() because the operation is still in progress
+		 * and we want to cancel it.
+		 */
+		if (curlm != nullptr) {
+			CURLMcode cm = curl_multi_remove_handle(curlm, curl);
+			if (cm != CURLM_OK) {
+				std::cerr << "Failed to remove handle from "
+					     "multi stack: "
+					  << curl_multi_strerror(cm)
+					  << std::endl;
+			}
+		}
 		curl_easy_cleanup(curl);
 	}
 }
@@ -294,16 +310,6 @@ PendingFile::StateStr() const
 	}
 
 	return std::string();
-}
-
-void
-PendingFile::SetTimeoutState()
-{
-	if (--timeout_retries >= 0) {
-		SetState(PendState::TimeoutRetry);
-	} else {
-		SetState(PendState::ProcFailure);
-	}
 }
 
 int
@@ -467,7 +473,7 @@ class LibraryBackend : public Backend {
 	LibraryBackend(std::string host, unsigned short port);
 	virtual bool Probe();
 	std::unique_ptr<BackendTransaction> CreateTransaction(
-	    const std::string &filepath, bool retry);
+	    const std::string &filepath, int retry);
 	std::string InteractiveURL() const { return int_url; }
 	std::string BatchURL() const { return bat_url; }
 };
@@ -475,7 +481,6 @@ class LibraryBackend : public Backend {
 class LibraryBackendTransaction : public BackendTransaction {
 	LibraryBackend *be = nullptr;
 	std::string filepath;
-	bool retry = false;
 	enum class State {
 		Init	       = 0,
 		WaitForPing    = 1,
@@ -491,10 +496,10 @@ class LibraryBackendTransaction : public BackendTransaction {
 
     public:
 	LibraryBackendTransaction(Backend *be, const std::string &filepath,
-				  bool retry)
-	    : be(dynamic_cast<LibraryBackend *>(be)),
-	      filepath(filepath),
-	      retry(retry)
+				  int retry)
+	    : BackendTransaction(retry),
+	      be(dynamic_cast<LibraryBackend *>(be)),
+	      filepath(filepath)
 	{
 		assert(this->be != nullptr);
 	}
@@ -517,7 +522,7 @@ LibraryBackendTransaction::PrepareRequest(std::string &url, std::string &req)
 	case State::ReadyToProcess: {
 		url		   = be->BatchURL() + "/process";
 		jsreq["file_name"] = filepath;
-		if (retry) {
+		if (Retry() > 0) {
 			/* Disable STT if this is a retry. */
 			jsreq["stt_mode"] = "";
 		}
@@ -674,7 +679,7 @@ end:
 }
 
 std::unique_ptr<BackendTransaction>
-LibraryBackend::CreateTransaction(const std::string &filepath, bool retry)
+LibraryBackend::CreateTransaction(const std::string &filepath, int retry)
 {
 	return std::make_unique<LibraryBackendTransaction>(this, filepath,
 							   retry);
@@ -1260,8 +1265,8 @@ VCoproc::PreProcessNewFiles()
 		/* Retry to process this file after the timeout. */
 		if (pf->State() == PendState::TimeoutRetry) {
 			pf = std::move(PendingFile::Create(
-			    std::move(be->CreateTransaction(pf->FilePath(),
-							    /*retry=*/true)),
+			    std::move(be->CreateTransaction(
+				pf->FilePath(), pf->bt->Retry() + 1)),
 			    curlm, pf->FilePath(), verbose));
 			if (verbose) {
 				std::cout << logb(LogDbg)
@@ -1598,13 +1603,15 @@ VCoproc::TimeoutWaitingRequests()
 
 		if (pf->State() == PendState::WaitingResponse &&
 		    pf->InactivitySeconds() > 120.0) {
-			pf->SetTimeoutState();
 			std::cerr << logb(LogErr) << "File " << pf->FileName()
 				  << " timed out" << std::endl;
-			if (pf->State() == PendState::TimeoutRetry) {
+			if (pf->bt->Retry() < 2) {
+				SetPendingFileState(pf,
+						    PendState::TimeoutRetry);
 				stats.files_timedout++;
 				stats.bytes_timedout += pf->FileSize();
-			} else { /* PendState::ProcFailure */
+			} else {
+				SetPendingFileState(pf, PendState::ProcFailure);
 				stats.files_failed++;
 				stats.bytes_failed += pf->FileSize();
 			}
