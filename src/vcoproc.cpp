@@ -791,7 +791,6 @@ class VCoproc {
 	void PreparePostRequests();
 	bool RetireAndProcessPostResponses();
 	void FinalizeOutput(PendingFile *pf, bool success);
-	void TimeoutWaitingRequests();
 	void PostProcessFiles();
 	void CleanupCompletedFiles();
 	int UpdateStatistics(bool force);
@@ -1530,6 +1529,24 @@ VCoproc::PostProcessFiles()
 		bool success, failure;
 		auto &pf = kv.second;
 
+		/* Timeout check. */
+		if (pf->State() == PendState::WaitingResponse &&
+		    pf->InactivitySeconds() >
+			static_cast<float>(timeout_secs)) {
+			std::cerr << logb(LogErr) << "File " << pf->FileName()
+				  << " timed out" << std::endl;
+			if (pf->bt->Retry() < 2) {
+				SetPendingFileState(pf,
+						    PendState::TimeoutRetry);
+				stats.files_timedout++;
+				stats.bytes_timedout += pf->FileSize();
+			} else {
+				SetPendingFileState(pf, PendState::ProcFailure);
+				stats.files_failed++;
+				stats.bytes_failed += pf->FileSize();
+			}
+		}
+
 		success = pf->State() == PendState::ProcSuccess;
 		failure = pf->State() == PendState::ProcFailure;
 
@@ -1613,31 +1630,6 @@ VCoproc::PostProcessFiles()
 		stats.procsec_completed += pf->AgeSeconds();
 
 		SetPendingFileState(pf, PendState::Complete);
-	}
-}
-
-void
-VCoproc::TimeoutWaitingRequests()
-{
-	for (auto &kv : pending) {
-		auto &pf = kv.second;
-
-		if (pf->State() == PendState::WaitingResponse &&
-		    pf->InactivitySeconds() >
-			static_cast<float>(timeout_secs)) {
-			std::cerr << logb(LogErr) << "File " << pf->FileName()
-				  << " timed out" << std::endl;
-			if (pf->bt->Retry() < 2) {
-				SetPendingFileState(pf,
-						    PendState::TimeoutRetry);
-				stats.files_timedout++;
-				stats.bytes_timedout += pf->FileSize();
-			} else {
-				SetPendingFileState(pf, PendState::ProcFailure);
-				stats.files_failed++;
-				stats.bytes_failed += pf->FileSize();
-			}
-		}
 	}
 }
 
@@ -1888,8 +1880,10 @@ VCoproc::MainLoop()
 			break;
 		}
 
-		/* Scan any new entries and carry out some
-		 * pre-processing. */
+		/*
+		 * Scan any new entries and carry out some
+		 * pre-processing.
+		 */
 		PreProcessNewFiles();
 
 		/*
@@ -1953,16 +1947,11 @@ VCoproc::MainLoop()
 		}
 
 		/*
-		 * Post process any entries in ProcSuccess or
-		 * ProcFailure state.
+		 * Post process any entries in ProcSuccess or ProcFailure state.
+		 * Also mark timed out entries as failed. They will be removed
+		 * during the next step.
 		 */
 		PostProcessFiles();
-
-		/*
-		 * Mark timed out entries as failed. They will
-		 * be removed during the next step.
-		 */
-		TimeoutWaitingRequests();
 
 		/*
 		 * Remove any completed entries from the
