@@ -1474,7 +1474,7 @@ VCoproc::FinalizeOutput(PendingFile *pf, bool success)
 
 	if (success) {
 		/* Output JSON. */
-		std::string jsname = pf->FileName();
+		std::stringstream jsname;
 		std::string jspath;
 
 		pf->jout["origin"] = source;
@@ -1484,8 +1484,14 @@ VCoproc::FinalizeOutput(PendingFile *pf, bool success)
 			pf->jout["metadata"] = jmdata;
 		}
 
-		jsname = PathNameNewExt(jsname, "json");
-		jspath = PathJoin(output_dir, jsname);
+		jsname
+		    << source << "_"
+		    << std::chrono::duration_cast<std::chrono::microseconds>(
+			   std::chrono::system_clock::now().time_since_epoch())
+			   .count()
+		    << ".json";
+
+		jspath = PathJoin(output_dir, jsname.str());
 		std::ofstream fout(jspath);
 		fout << json11::Json(pf->jout).dump();
 		fout << std::endl;
