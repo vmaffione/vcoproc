@@ -111,8 +111,10 @@ class BackendTransaction {
 	BackendTransaction(int retry) : retry(retry) {}
 	int Retry() const { return retry; }
 	virtual int PrepareRequest(std::string &url, std::string &req) = 0;
-	virtual int ProcessResponse(std::string &resp,
-				    json11::Json::object &jout)	       = 0;
+	virtual int ProcessResponse(std::string &resp)		       = 0;
+
+	/* Accumulator for the JSON output associated to this transaction. */
+	json11::Json::object jout;
 };
 
 class Backend {
@@ -175,9 +177,6 @@ class PendingFile {
 	std::string jmdatapath;
 
     public:
-	/* Accumulator for the JSON output associated to this file. */
-	json11::Json::object jout;
-
 	PendingFile(std::vector<std::unique_ptr<BackendTransaction>> bts,
 		    CURLM *curlm, CURL *curl, const std::string &src_path,
 		    size_t src_size, int verbose)
@@ -214,6 +213,7 @@ class PendingFile {
 	float AgeSeconds() const { return SecsElapsed(proc_start); }
 	BackendTransaction *CurBeTransaction() const;
 	bool NextBeTransaction();
+	int MergeTransactionsResults(json11::Json::object &jout) const;
 };
 
 std::unique_ptr<PendingFile>
@@ -497,6 +497,65 @@ PendingFile::NextBeTransaction()
 	return ++bt_idx < bts.size();
 }
 
+int
+PendingFile::MergeTransactionsResults(json11::Json::object &jout) const
+{
+	json11::Json::array ar;
+
+	jout = json11::Json::object();
+
+	for (size_t bi = 0; bi < bts.size(); bi++) {
+		if (bts[bi] == nullptr) {
+			continue;
+		}
+
+		auto &oj      = bts[bi]->jout;
+		double weight = (oj["asr"] == "NVSL") ? 0.7 : 1.0;
+
+		/*
+		 * Here it's safe to assume that scores are numeric, and
+		 * that a score key is always associated with a label key.
+		 */
+		if (oj.count("gender") &&
+		    (!jout.count("gender") ||
+		     oj["gender_score"].number_value() >
+			 jout["gender_score"].number_value())) {
+			jout["gender"]	     = oj["gender"];
+			jout["gender_score"] = oj["gender_score"];
+		}
+
+		if (oj.count("language_iso") &&
+		    (!jout.count("language_iso") ||
+		     weight * oj["language_score"].number_value() >
+			 jout["language_score"].number_value())) {
+			jout["language_iso"]   = oj["language_iso"];
+			jout["language_score"] = oj["language_score"];
+		}
+
+		if (oj.count("speaker") &&
+		    (!jout.count("speaker") ||
+		     oj["speaker_score"].number_value() >
+			 jout["speaker_score"].number_value())) {
+			jout["speaker"]	      = oj["speaker"];
+			jout["speaker_score"] = oj["speaker_score"];
+		}
+
+		/* Merge missing fields. */
+		for (const auto &kv : oj) {
+			if (!jout.count(kv.first)) {
+				jout[kv.first] = kv.second;
+			}
+		}
+
+		/* Append backend results for reference. */
+		ar.push_back(oj);
+	}
+
+	jout["backends"] = ar;
+
+	return 0;
+}
+
 class LibraryBackend : public Backend {
 	std::string int_url;
 	std::string bat_url;
@@ -538,7 +597,7 @@ class LibraryBackendTransaction : public BackendTransaction {
 		assert(this->be != nullptr);
 	}
 	int PrepareRequest(std::string &url, std::string &req);
-	int ProcessResponse(std::string &resp, json11::Json::object &jout);
+	int ProcessResponse(std::string &resp);
 };
 
 int
@@ -578,8 +637,7 @@ LibraryBackendTransaction::PrepareRequest(std::string &url, std::string &req)
 }
 
 int
-LibraryBackendTransaction::ProcessResponse(std::string &resp,
-					   json11::Json::object &jout)
+LibraryBackendTransaction::ProcessResponse(std::string &resp)
 {
 	std::string errs;
 	json11::Json jsresp = json11::Json::parse(resp, errs);
@@ -827,7 +885,8 @@ class VCoproc {
 	void PreProcessNewFiles();
 	void PreparePostRequests();
 	bool RetireAndProcessPostResponses();
-	void FinalizeOutput(PendingFile *pf, bool success);
+	void FinalizeOutput(PendingFile *pf, json11::Json::object &jout,
+			    bool success);
 	void PostProcessFiles();
 	void CleanupCompletedFiles();
 	int UpdateStatistics(bool force);
@@ -1368,12 +1427,13 @@ VCoproc::PreProcessNewFiles()
 			 * If the file is empty, don't even bother processing
 			 * it.
 			 */
-			pf->jout["asr"]		= "vcoproc";
-			pf->jout["asr_version"] = VC_VERSION;
-			pf->jout["status"]	= "NOMETADATA";
-			pf->jout["length"]	= 0.0;
-			pf->jout["net_speech"]	= 0.0;
-			FinalizeOutput(pf.get(), /*success=*/true);
+			json11::Json::object jout;
+
+			jout["status"]	   = "NOMETADATA";
+			jout["length"]	   = 0.0;
+			jout["net_speech"] = 0.0;
+
+			FinalizeOutput(pf.get(), jout, /*success=*/true);
 		} else {
 			SetPendingFileState(pf, PendState::ReadyToSubmit);
 		}
@@ -1452,14 +1512,14 @@ VCoproc::RetireAndProcessPostResponses()
 			return false;
 		}
 
-		bool success = (http_code == 200);
+		bool success	       = (http_code == 200);
+		BackendTransaction *bt = pf->CurBeTransaction();
 		std::string resp;
 
 		if (pf->RetirePostCurl(resp)) {
 			success = false;
 		} else {
-			int r = pf->CurBeTransaction()->ProcessResponse(
-			    resp, pf->jout);
+			int r = bt->ProcessResponse(resp);
 			if (r == 0) {
 				/*
 				 * The transaction is not
@@ -1473,13 +1533,45 @@ VCoproc::RetireAndProcessPostResponses()
 		}
 
 		/*
-		 * Transaction is complete.
+		 * The current transaction is complete. Perform some sanity
+		 * checks before going ahead.
 		 */
 		if (verbose) {
 			std::cout << logb(LogDbg) << "Processed "
 				  << pf->FileName() << " --> " << http_code
-				  << " " << json11::Json(pf->jout).dump()
+				  << " " << json11::Json(bt->jout).dump()
 				  << std::endl;
+		}
+
+		if (bt->jout.count("gender") !=
+			bt->jout.count("gender_score") ||
+		    (bt->jout.count("gender_score") &&
+		     !bt->jout["gender_score"].is_number())) {
+			std::cerr << logb(LogErr) << "Invalid gender results"
+				  << std::endl;
+			success	 = false;
+			bt->jout = json11::Json::object(); /* drastic */
+		}
+
+		if (bt->jout.count("language_iso") +
+			    bt->jout.count("language_ietf") !=
+			bt->jout.count("language_score") ||
+		    (bt->jout.count("language_score") &&
+		     !bt->jout["language_score"].is_number())) {
+			std::cerr << logb(LogErr) << "Invalid language results"
+				  << std::endl;
+			success	 = false;
+			bt->jout = json11::Json::object();
+		}
+
+		if (bt->jout.count("speaker") !=
+			bt->jout.count("speaker_score") ||
+		    (bt->jout.count("speaker_score") &&
+		     !bt->jout["speaker_score"].is_number())) {
+			std::cerr << logb(LogErr) << "Invalid speaker results"
+				  << std::endl;
+			success	 = false;
+			bt->jout = json11::Json::object();
 		}
 
 		if (pf->NextBeTransaction()) {
@@ -1489,35 +1581,40 @@ VCoproc::RetireAndProcessPostResponses()
 		}
 
 		/*
-		 * All transactions are complete. Finalize and output
-		 * the JSON.
+		 * All transactions are complete. Merge all the JSON results
+		 * into a single one, then finalize and output.
 		 */
-		FinalizeOutput(pf, success);
+		json11::Json::object jout;
+		pf->MergeTransactionsResults(jout);
+		FinalizeOutput(pf, jout, success);
 	}
 
 	return true;
 }
 
 void
-VCoproc::FinalizeOutput(PendingFile *pf, bool success)
+VCoproc::FinalizeOutput(PendingFile *pf, json11::Json::object &jout,
+			bool success)
 {
 	double audio_len  = 0;
 	double speech_len = 0;
 
-	if (!pf->jout.count("status")) {
+	jout["asr"]	    = "VCoProc";
+	jout["asr_version"] = VC_VERSION;
+
+	if (!jout.count("status")) {
 		std::cerr << logb(LogErr) << "Missing status key" << std::endl;
 		success = false;
 	} else {
-		success = (pf->jout["status"] == "COMPLETE") ||
-			  (pf->jout["status"] == "NOMETADATA");
+		success = (jout["status"] == "COMPLETE") ||
+			  (jout["status"] == "NOMETADATA");
 	}
 
-	if (pf->jout.count("length") && pf->jout["length"].is_number()) {
-		audio_len = pf->jout["length"].number_value();
+	if (jout.count("length") && jout["length"].is_number()) {
+		audio_len = jout["length"].number_value();
 	}
-	if (pf->jout.count("net_speech") &&
-	    pf->jout["net_speech"].is_number()) {
-		speech_len = pf->jout["net_speech"].number_value();
+	if (jout.count("net_speech") && jout["net_speech"].is_number()) {
+		speech_len = jout["net_speech"].number_value();
 	}
 
 	if (success) {
@@ -1525,11 +1622,11 @@ VCoproc::FinalizeOutput(PendingFile *pf, bool success)
 		std::stringstream jsname;
 		std::string jspath;
 
-		pf->jout["origin"] = source;
+		jout["origin"] = source;
 
 		json11::Json jmdata = pf->GetMetadata();
 		if (jmdata != json11::Json()) {
-			pf->jout["metadata"] = jmdata;
+			jout["metadata"] = jmdata;
 		}
 
 		jsname
@@ -1541,7 +1638,7 @@ VCoproc::FinalizeOutput(PendingFile *pf, bool success)
 
 		jspath = PathJoin(output_dir, jsname.str());
 		std::ofstream fout(jspath);
-		fout << json11::Json(pf->jout).dump();
+		fout << json11::Json(jout).dump();
 		fout << std::endl;
 	}
 
@@ -1551,7 +1648,7 @@ VCoproc::FinalizeOutput(PendingFile *pf, bool success)
 		stats.bytes_failed += pf->FileSize();
 	} else {
 		SetPendingFileState(pf, PendState::ProcSuccess);
-		if (pf->jout["status"] == "COMPLETE") {
+		if (jout["status"] == "COMPLETE") {
 			stats.files_scored++;
 			stats.bytes_scored += pf->FileSize();
 			stats.audiosec_scored += audio_len;
