@@ -75,9 +75,8 @@ Usage(const char *progname)
 	    << "    -R RETENTION_DAYS (how long to keep statistics, "
 	       "in days)"
 	    << std::endl
-	    << "    -H BACKEND_HOST (address or name of the backend engine)"
-	    << std::endl
-	    << "    -p BACKEND_PORT (TCP port of the backend engine)"
+	    << "    -B BACKEND_HOST:BACKEND_PORT (address of the backend "
+	       "engine)"
 	    << std::endl;
 }
 
@@ -103,6 +102,16 @@ SigintHandler(int signum)
 }
 
 } // namespace
+
+struct BackendSpec {
+	std::string host;
+	unsigned short port;
+
+	BackendSpec(std::string h, unsigned short p)
+	    : host(std::move(h)), port(p)
+	{
+	}
+};
 
 class BackendTransaction {
 	int retry = 0;
@@ -561,9 +570,8 @@ class LibraryBackend : public Backend {
 	std::string bat_url;
 
     public:
-	static std::unique_ptr<Backend> Create(std::string host,
-					       unsigned short port);
-	LibraryBackend(std::string host, unsigned short port);
+	static std::unique_ptr<Backend> Create(const BackendSpec &bspec);
+	LibraryBackend(const BackendSpec &bspec);
 	virtual bool Probe();
 	std::unique_ptr<BackendTransaction> CreateTransaction(
 	    const std::string &filepath, int retry);
@@ -674,20 +682,20 @@ LibraryBackendTransaction::ProcessResponse(std::string &resp)
 }
 
 std::unique_ptr<Backend>
-LibraryBackend::Create(std::string host, unsigned short port)
+LibraryBackend::Create(const BackendSpec &bspec)
 {
-	return std::make_unique<LibraryBackend>(host, port);
+	return std::make_unique<LibraryBackend>(bspec);
 }
 
-LibraryBackend::LibraryBackend(std::string host, unsigned short port)
+LibraryBackend::LibraryBackend(const BackendSpec &bspec)
 {
 	std::stringstream ss;
 
-	ss << "http://" << host << ":" << port;
+	ss << "http://" << bspec.host << ":" << bspec.port;
 	int_url = ss.str();
 
 	ss = std::stringstream();
-	ss << "http://" << host << ":" << port + 1;
+	ss << "http://" << bspec.host << ":" << bspec.port + 1;
 	bat_url = ss.str();
 }
 
@@ -781,7 +789,7 @@ LibraryBackend::CreateTransaction(const std::string &filepath, int retry)
 class VCoproc {
 	int stopfd   = -1; /* owned by the caller, not by us */
 	CURLM *curlm = nullptr;
-	std::unique_ptr<Backend> be;
+	std::vector<std::unique_ptr<Backend>> backends;
 	int verbose  = 0;
 	bool consume = false;
 	bool monitor = false;
@@ -828,8 +836,7 @@ class VCoproc {
 
 	struct DbSpec dbspec;
 	std::unique_ptr<DbConn> dbconn;
-	std::string host;
-	unsigned short port  = 0;
+	std::vector<BackendSpec> bspecs;
 	size_t input_dir_idx = 0;
 
 	/*
@@ -904,10 +911,10 @@ class VCoproc {
 	    unsigned short max_pending, unsigned short timeout_secs,
 	    unsigned short max_retries, unsigned short dir_min_age,
 	    unsigned int stats_period, unsigned int retention_days,
-	    struct DbSpec dbspec, std::string host, unsigned short port);
+	    struct DbSpec dbspec, std::vector<BackendSpec> bspecs);
 
-	VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend>, int verbose,
-		bool consume, bool monitor, std::string source,
+	VCoproc(int stopfd, CURLM *curlm, std::vector<std::unique_ptr<Backend>>,
+		int verbose, bool consume, bool monitor, std::string source,
 		std::vector<std::string> input_dirs,
 		std::vector<std::string> input_exts, std::string output_dir,
 		std::string failed_dir, std::string forward_dir,
@@ -916,7 +923,7 @@ class VCoproc {
 		unsigned short max_retries, unsigned short dir_min_age,
 		unsigned int stats_period, unsigned int retention_days,
 		struct DbSpec dbspec, std::unique_ptr<DbConn> dbconn,
-		std::string host, unsigned short port);
+		std::vector<BackendSpec> bspecs);
 	~VCoproc();
 	int MainLoop();
 };
@@ -930,7 +937,7 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		unsigned short max_pending, unsigned short timeout_secs,
 		unsigned short max_retries, unsigned short dir_min_age,
 		unsigned int stats_period, unsigned int retention_days,
-		struct DbSpec dbspec, std::string host, unsigned short port)
+		struct DbSpec dbspec, std::vector<BackendSpec> bspecs)
 {
 	if (source.empty()) {
 		std::cerr << logb(LogErr) << "No source/origin specified (-s)"
@@ -1004,32 +1011,28 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 		return nullptr;
 	}
 
-	if (host.empty()) {
-		std::cerr << logb(LogErr) << "No hostname specified (-H)"
-			  << std::endl;
-		return nullptr;
-	}
-
-	if (port == 0) {
-		std::cerr << logb(LogErr) << "No port specified (-p)"
-			  << std::endl;
-		return nullptr;
-	}
-
 	if (monitor) {
 		/* We must consume in monitor mode. */
 		consume = true;
 	}
 
-	auto be = LibraryBackend::Create(host, port);
-	if (be == nullptr) {
-		std::cerr << logb(LogErr) << "Failed to create backend"
-			  << std::endl;
-		return nullptr;
+	/* Create the backends. */
+	std::vector<std::unique_ptr<Backend>> backends;
+
+	for (size_t bi = 0; bi < bspecs.size(); bi++) {
+		auto be = LibraryBackend::Create(bspecs[bi]);
+
+		if (be == nullptr) {
+			std::cerr << logb(LogErr)
+				  << "Failed to create backend #" << bi + 1
+				  << std::endl;
+			return nullptr;
+		}
+
+		backends.push_back(std::move(be));
 	}
 
 	/* Open a (long-lived) database connection. */
-
 	std::unique_ptr<DbConn> dbconn;
 
 	if (dbspec.IsMySQL()) {
@@ -1107,17 +1110,18 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 	}
 
 	return std::make_unique<VCoproc>(
-	    stopfd, curlm, std::move(be), verbose, consume, monitor,
+	    stopfd, curlm, std::move(backends), verbose, consume, monitor,
 	    std::move(source), std::move(input_dirs), std::move(input_exts),
 	    std::move(output_dir), std::move(failed_dir),
 	    std::move(forward_dir), std::move(archive_dir), compress_archived,
 	    max_pending, timeout_secs, max_retries, dir_min_age, stats_period,
 	    retention_days, std::move(dbspec), std::move(dbconn),
-	    std::move(host), port);
+	    std::move(bspecs));
 }
 
-VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
-		 int verbose, bool consume, bool monitor, std::string source,
+VCoproc::VCoproc(int stopfd, CURLM *curlm,
+		 std::vector<std::unique_ptr<Backend>> backends, int verbose,
+		 bool consume, bool monitor, std::string source,
 		 std::vector<std::string> input_dirs,
 		 std::vector<std::string> input_exts, std::string output_dir,
 		 std::string failed_dir, std::string forward_dir,
@@ -1126,10 +1130,10 @@ VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
 		 unsigned short max_retries, unsigned short dir_min_age,
 		 unsigned int stats_period, unsigned int retention_days,
 		 struct DbSpec dbspec, std::unique_ptr<DbConn> dbconn,
-		 std::string host, unsigned short port)
+		 std::vector<BackendSpec> bspecs)
     : stopfd(stopfd),
       curlm(curlm),
-      be(std::move(be)),
+      backends(std::move(backends)),
       verbose(verbose),
       consume(consume),
       monitor(monitor),
@@ -1149,8 +1153,7 @@ VCoproc::VCoproc(int stopfd, CURLM *curlm, std::unique_ptr<Backend> be,
       retention_days(retention_days),
       dbspec(std::move(dbspec)),
       dbconn(std::move(dbconn)),
-      host(std::move(host)),
-      port(port),
+      bspecs(std::move(bspecs)),
       stats_start(std::chrono::system_clock::now())
 {
 }
@@ -1362,7 +1365,10 @@ VCoproc::FetchFilesFromDir(const DFSDir &dfsdir, std::deque<DFSDir> &frontier,
 		} else if (pit == pending.end() && pending.size() < 16384) {
 			std::vector<std::unique_ptr<BackendTransaction>> bts;
 
-			bts.emplace_back(be->CreateTransaction(path));
+			for (size_t bi = 0; bi < backends.size(); bi++) {
+				bts.emplace_back(
+				    backends[bi]->CreateTransaction(path));
+			}
 
 			pending[path] = std::move(PendingFile::Create(
 			    std::move(bts), curlm, path, verbose));
@@ -1392,9 +1398,12 @@ VCoproc::PreProcessNewFiles()
 		if (pf->State() == PendState::TimeoutRetry) {
 			std::vector<std::unique_ptr<BackendTransaction>> bts;
 
-			bts.emplace_back(be->CreateTransaction(
-			    pf->FilePath(),
-			    pf->CurBeTransaction()->Retry() + 1));
+			for (size_t bi = 0; bi < backends.size(); bi++) {
+				bts.emplace_back(
+				    backends[bi]->CreateTransaction(
+					pf->FilePath(),
+					pf->CurBeTransaction()->Retry() + 1));
+			}
 
 			pf = std::move(PendingFile::Create(
 			    std::move(bts), curlm, pf->FilePath(), verbose));
@@ -1890,7 +1899,7 @@ VCoproc::WaitForBackend()
 	pfd[0].fd     = stopfd;
 	pfd[0].events = POLLIN;
 
-	do {
+	for (;;) {
 		int ret = poll(pfd, 1, /*timeout_ms=*/milliseconds);
 
 		if (ret < 0) {
@@ -1928,7 +1937,19 @@ VCoproc::WaitForBackend()
 		 * issue that triggers the MainLoop to call
 		 * WaitForBackend() again and again).
 		 */
-	} while (be->Probe() == false);
+		bool everybody_up = true;
+
+		for (size_t bi = 0; bi < backends.size(); bi++) {
+			if (!backends[bi]->Probe()) {
+				everybody_up = false;
+				break;
+			}
+		}
+
+		if (everybody_up) {
+			break;
+		}
+	}
 
 	/* Backend is online. We can return. */
 	return 0;
@@ -2151,8 +2172,7 @@ main(int argc, char **argv)
 	std::string forward_dir;
 	std::string archive_dir;
 	std::string source;
-	std::string host;
-	unsigned short port = 0;
+	std::vector<BackendSpec> backend_specs;
 	struct sigaction sa;
 	int verbose	       = 0;
 	bool consume	       = false;
@@ -2196,7 +2216,7 @@ main(int argc, char **argv)
 	}
 
 	while ((opt = getopt(argc, argv,
-			     "hVvi:o:F:f:a:CcmD:H:p:s:e:n:T:R:A:t:r:")) != -1) {
+			     "hVvi:o:F:f:a:CcmD:B:s:e:n:T:R:A:t:r:")) != -1) {
 		switch (opt) {
 		case 'h':
 			Usage(argv[0]);
@@ -2363,17 +2383,26 @@ main(int argc, char **argv)
 			break;
 		}
 
-		case 'H':
-			host = optarg;
-			break;
+		case 'B': {
+			std::string optstr = optarg;
+			unsigned short port;
+			std::smatch match;
+			std::string host;
 
-		case 'p':
-			if (!Str2Num<unsigned short>(optarg, port)) {
-				std::cerr << logb(LogErr) << "Invalid port "
+			if (!std::regex_match(
+				optstr, match,
+				std::regex("([a-zA-Z0-9.-]+):([1-9][0-9]*)"))) {
+				std::cerr << logb(LogErr)
+					  << "Invalid backend address "
 					  << optarg << std::endl;
 				return -1;
 			}
+			host = match[1];
+			Str2Num<unsigned short>(match[2], port);
+			backend_specs.emplace_back(
+			    BackendSpec(std::move(host), port));
 			break;
+		}
 
 		case 'e': {
 			std::string ext = std::string(optarg);
@@ -2421,7 +2450,7 @@ main(int argc, char **argv)
 	    std::move(failed_dir), std::move(forward_dir),
 	    std::move(archive_dir), compress_archived, max_pending,
 	    timeout_secs, max_retries, dir_min_age, stats_period,
-	    retention_days, std::move(dbspec), host, port);
+	    retention_days, std::move(dbspec), std::move(backend_specs));
 	if (vcoproc == nullptr) {
 		return -1;
 	}
