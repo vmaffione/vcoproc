@@ -142,7 +142,8 @@ class PendingFile {
 		Prepared = 1,
 	};
 
-	std::unique_ptr<BackendTransaction> bt;
+	std::vector<std::unique_ptr<BackendTransaction>> bts;
+	size_t bt_idx = 0;
 
     private:
 	CURLM *curlm = nullptr;
@@ -177,10 +178,10 @@ class PendingFile {
 	/* Accumulator for the JSON output associated to this file. */
 	json11::Json::object jout;
 
-	PendingFile(std::unique_ptr<BackendTransaction> bt, CURLM *curlm,
-		    CURL *curl, const std::string &src_path, size_t src_size,
-		    int verbose)
-	    : bt(std::move(bt)),
+	PendingFile(std::vector<std::unique_ptr<BackendTransaction>> bts,
+		    CURLM *curlm, CURL *curl, const std::string &src_path,
+		    size_t src_size, int verbose)
+	    : bts(std::move(bts)),
 	      curlm(curlm),
 	      curl(curl),
 	      src_path(src_path),
@@ -200,7 +201,7 @@ class PendingFile {
 	std::string FileName() const { return FileBaseName(src_path); }
 	size_t FileSize() const { return src_size; }
 	static std::unique_ptr<PendingFile> Create(
-	    std::unique_ptr<BackendTransaction> bt, CURLM *curlm,
+	    std::vector<std::unique_ptr<BackendTransaction>> bts, CURLM *curlm,
 	    const std::string &src_path, int verbose);
 	int LoadMetadata(const std::string &mdatapath);
 	json11::Json GetMetadata() const;
@@ -211,17 +212,25 @@ class PendingFile {
 	int RetirePostCurl(std::string &resp);
 	float InactivitySeconds() const { return SecsElapsed(last_activity); }
 	float AgeSeconds() const { return SecsElapsed(proc_start); }
+	BackendTransaction *CurBeTransaction() const;
+	bool NextBeTransaction();
 };
 
 std::unique_ptr<PendingFile>
-PendingFile::Create(std::unique_ptr<BackendTransaction> bt, CURLM *curlm,
-		    const std::string &src_path, int verbose)
+PendingFile::Create(std::vector<std::unique_ptr<BackendTransaction>> bts,
+		    CURLM *curlm, const std::string &src_path, int verbose)
 {
 	CURLcode cc;
 	CURL *curl;
 
-	if (curlm == nullptr || bt == nullptr) {
+	if (curlm == nullptr) {
 		return nullptr;
+	}
+
+	for (const auto &bt : bts) {
+		if (bt == nullptr) {
+			return nullptr;
+		}
 	}
 
 	curl = curl_easy_init();
@@ -246,8 +255,8 @@ PendingFile::Create(std::unique_ptr<BackendTransaction> bt, CURLM *curlm,
 	}
 
 	auto pf = std::make_unique<PendingFile>(
-	    std::move(bt), curlm, curl, src_path, static_cast<size_t>(src_size),
-	    verbose);
+	    std::move(bts), curlm, curl, src_path,
+	    static_cast<size_t>(src_size), verbose);
 
 	/* Link the new PendingFile instance to the curl handle. */
 	cc = curl_easy_setopt(curl, CURLOPT_PRIVATE, (void *)pf.get());
@@ -466,6 +475,26 @@ PendingFile::RetirePostCurl(std::string &respstr)
 	last_activity = std::chrono::system_clock::now();
 
 	return 0;
+}
+
+BackendTransaction *
+PendingFile::CurBeTransaction() const
+{
+	if (bt_idx >= bts.size()) {
+		return nullptr;
+	}
+
+	return bts[bt_idx].get();
+}
+
+bool
+PendingFile::NextBeTransaction()
+{
+	if (bt_idx >= bts.size()) {
+		return false;
+	}
+
+	return ++bt_idx < bts.size();
 }
 
 class LibraryBackend : public Backend {
@@ -1272,9 +1301,12 @@ VCoproc::FetchFilesFromDir(const DFSDir &dfsdir, std::deque<DFSDir> &frontier,
 		    (consume || pit->second->State() != PendState::Complete)) {
 			credits--;
 		} else if (pit == pending.end() && pending.size() < 16384) {
+			std::vector<std::unique_ptr<BackendTransaction>> bts;
+
+			bts.emplace_back(be->CreateTransaction(path));
+
 			pending[path] = std::move(PendingFile::Create(
-			    std::move(be->CreateTransaction(path)), curlm, path,
-			    verbose));
+			    std::move(bts), curlm, path, verbose));
 			if (verbose) {
 				std::cout << logb(LogDbg) << "New file "
 					  << pending[path]->FileName()
@@ -1299,10 +1331,14 @@ VCoproc::PreProcessNewFiles()
 
 		/* Retry to process this file after the timeout. */
 		if (pf->State() == PendState::TimeoutRetry) {
+			std::vector<std::unique_ptr<BackendTransaction>> bts;
+
+			bts.emplace_back(be->CreateTransaction(
+			    pf->FilePath(),
+			    pf->CurBeTransaction()->Retry() + 1));
+
 			pf = std::move(PendingFile::Create(
-			    std::move(be->CreateTransaction(
-				pf->FilePath(), pf->bt->Retry() + 1)),
-			    curlm, pf->FilePath(), verbose));
+			    std::move(bts), curlm, pf->FilePath(), verbose));
 			if (verbose) {
 				std::cout << logb(LogDbg)
 					  << "Reprocessing file "
@@ -1358,7 +1394,7 @@ VCoproc::PreparePostRequests()
 		std::string url;
 
 		/* Get the URL and content for the next POST. */
-		int r = pf->bt->PrepareRequest(url, req);
+		int r = pf->CurBeTransaction()->PrepareRequest(url, req);
 		if (r) {
 			SetPendingFileState(pf, PendState::ProcFailure);
 			continue;
@@ -1422,10 +1458,13 @@ VCoproc::RetireAndProcessPostResponses()
 		if (pf->RetirePostCurl(resp)) {
 			success = false;
 		} else {
-			int r = pf->bt->ProcessResponse(resp, pf->jout);
+			int r = pf->CurBeTransaction()->ProcessResponse(
+			    resp, pf->jout);
 			if (r == 0) {
-				/* The transaction is not
-				 * complete yet. */
+				/*
+				 * The transaction is not
+				 * complete yet.
+				 */
 				SetPendingFileState(pf,
 						    PendState::ReadyToSubmit);
 				continue;
@@ -1433,6 +1472,9 @@ VCoproc::RetireAndProcessPostResponses()
 			success = r > 0;
 		}
 
+		/*
+		 * Transaction is complete.
+		 */
 		if (verbose) {
 			std::cout << logb(LogDbg) << "Processed "
 				  << pf->FileName() << " --> " << http_code
@@ -1440,8 +1482,14 @@ VCoproc::RetireAndProcessPostResponses()
 				  << std::endl;
 		}
 
+		if (pf->NextBeTransaction()) {
+			/* More transactions are pending. */
+			SetPendingFileState(pf, PendState::ReadyToSubmit);
+			continue;
+		}
+
 		/*
-		 * Transaction is complete. Finalize and output
+		 * All transactions are complete. Finalize and output
 		 * the JSON.
 		 */
 		FinalizeOutput(pf, success);
@@ -1556,7 +1604,7 @@ VCoproc::PostProcessFiles()
 			static_cast<float>(timeout_secs)) {
 			std::cerr << logb(LogErr) << "File " << pf->FileName()
 				  << " timed out" << std::endl;
-			if (pf->bt->Retry() < max_retries) {
+			if (pf->CurBeTransaction()->Retry() < max_retries) {
 				SetPendingFileState(pf,
 						    PendState::TimeoutRetry);
 				stats.files_timedout++;
