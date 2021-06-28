@@ -510,6 +510,8 @@ int
 PendingFile::MergeTransactionsResults(json11::Json::object &jout) const
 {
 	json11::Json::array ar;
+	enum { StatusError = 0, StatusNometadata = 1, StatusComplete = 2 };
+	int best_status = StatusError;
 
 	jout = json11::Json::object();
 
@@ -549,6 +551,17 @@ PendingFile::MergeTransactionsResults(json11::Json::object &jout) const
 			jout["speaker_score"] = oj["speaker_score"];
 		}
 
+		/* We already know we have a status. */
+		int status = 0;
+		if (oj["status"] == "COMPLETE") {
+			status = StatusComplete;
+		} else if (oj["status"] == "NOMETADATA") {
+			status = StatusNometadata;
+		} else if (oj["status"] == "ERROR") {
+			status = StatusError;
+		}
+		best_status = std::max(status, best_status);
+
 		/* Merge missing fields. */
 		for (const auto &kv : oj) {
 			if (!jout.count(kv.first)) {
@@ -560,6 +573,19 @@ PendingFile::MergeTransactionsResults(json11::Json::object &jout) const
 		ar.push_back(oj);
 	}
 
+	switch (best_status) {
+	case StatusError:
+		jout["status"] = "ERROR";
+		break;
+
+	case StatusNometadata:
+		jout["status"] = "NOMETADATA";
+		break;
+
+	case StatusComplete:
+		jout["status"] = "COMPLETE";
+		break;
+	}
 	jout["backends"] = ar;
 
 	return 0;
@@ -1007,6 +1033,12 @@ VCoproc::Create(int stopfd, int verbose, bool consume, bool monitor,
 
 	if (!dbspec.IsMySQL() && !dbspec.IsSQLite()) {
 		std::cerr << logb(LogErr) << "No valid database specified (-D)"
+			  << std::endl;
+		return nullptr;
+	}
+
+	if (bspecs.empty()) {
+		std::cerr << logb(LogErr) << "No backend specified (-B)"
 			  << std::endl;
 		return nullptr;
 	}
@@ -1552,6 +1584,13 @@ VCoproc::RetireAndProcessPostResponses()
 				  << std::endl;
 		}
 
+		if (!bt->jout.count("status")) {
+			std::cerr << logb(LogErr) << "Missing status key"
+				  << std::endl;
+			success	 = false;
+			bt->jout = json11::Json::object(); /* drastic */
+		}
+
 		if (bt->jout.count("gender") !=
 			bt->jout.count("gender_score") ||
 		    (bt->jout.count("gender_score") &&
@@ -1559,7 +1598,7 @@ VCoproc::RetireAndProcessPostResponses()
 			std::cerr << logb(LogErr) << "Invalid gender results"
 				  << std::endl;
 			success	 = false;
-			bt->jout = json11::Json::object(); /* drastic */
+			bt->jout = json11::Json::object();
 		}
 
 		if (bt->jout.count("language_iso") +
