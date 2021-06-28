@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.10)
 project(vcoproc)
 
 set(VCOPROC_VER_MAJ 1)
-set(VCOPROC_VER_MIN 21)
+set(VCOPROC_VER_MIN 22)
 
 # Compiler checks
 message(STATUS "C Compiler: ${CMAKE_C_COMPILER}")
