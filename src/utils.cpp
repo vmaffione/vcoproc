@@ -480,7 +480,8 @@ RemoveFile(const std::string &path, bool may_not_exist)
 }
 
 std::unique_ptr<DirScanner>
-DirScanner::Create(const std::string &path, bool safe)
+DirScanner::Create(const std::string &path, unsigned int types, bool hidden,
+		   bool safe)
 {
 	DIR *dir = opendir(path.c_str());
 
@@ -490,16 +491,19 @@ DirScanner::Create(const std::string &path, bool safe)
 		return nullptr;
 	}
 
-	return std::make_unique<DirScanner>(dir, safe);
+	return std::make_unique<DirScanner>(dir, types, hidden, safe);
 }
 
-DirScanner::~DirScanner()
+void
+DirScanner::Close()
 {
-	if (dir) {
+	if (dir != nullptr) {
 		closedir(dir);
 		dir = nullptr;
 	}
 }
+
+DirScanner::~DirScanner() { Close(); }
 
 bool
 DirScanner::DoNext(std::string &entry)
@@ -507,8 +511,16 @@ DirScanner::DoNext(std::string &entry)
 	struct dirent *dent;
 
 	while ((dent = readdir(dir)) != nullptr) {
-		if (strcmp(dent->d_name, ".") && strcmp(dent->d_name, "..")) {
-			entry = std::string(dent->d_name);
+		std::string name = dent->d_name;
+
+		if (!strcmp(dent->d_name, ".") || !strcmp(dent->d_name, "..") ||
+		    (!hidden && name[0] == '.')) {
+			continue;
+		}
+
+		if (((types & File) && dent->d_type == DT_REG) ||
+		    ((types & Dir) && dent->d_type == DT_DIR)) {
+			entry = name;
 			return true;
 		}
 	}
@@ -532,10 +544,12 @@ DirScanner::Next(std::string &entry)
 		}
 		next_file_idx = 0;
 	}
+
 	if (next_file_idx < static_cast<int>(files.size())) {
 		entry = files[next_file_idx++];
 		return true;
 	}
+
 	return false;
 }
 

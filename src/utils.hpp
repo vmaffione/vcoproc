@@ -61,8 +61,10 @@ int MoveToDir(const std::string &dir, const std::string &src);
 int RemoveFile(const std::string &path, bool may_not_exist = false);
 
 class DirScanner {
-	DIR *dir  = nullptr;
-	bool safe = false;
+	DIR *dir	   = nullptr;
+	unsigned int types = 0;
+	bool hidden	   = false;
+	bool safe	   = false;
 	/* List of files, to be used in case safe = true. */
 	std::vector<std::string> files;
 	int next_file_idx = -1;
@@ -70,10 +72,20 @@ class DirScanner {
 	bool DoNext(std::string &entry);
 
     public:
+	static constexpr unsigned int File = (1 << 0);
+	static constexpr unsigned int Dir  = (1 << 1);
+
 	static std::unique_ptr<DirScanner> Create(const std::string &path,
-						  bool safe = false);
-	DirScanner(DIR *d, bool safe) : dir(d), safe(safe) {}
+						  unsigned int types = File |
+								       Dir,
+						  bool hidden = false,
+						  bool safe   = false);
+	DirScanner(DIR *d, unsigned int types, bool hidden, bool safe)
+	    : dir(d), types(types), hidden(hidden), safe(safe)
+	{
+	}
 	~DirScanner();
+	void Close();
 	bool Next(std::string &entry);
 };
 
